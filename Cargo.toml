@@ -1,0 +1,33 @@
+[package]
+authors = ["Bryant Luk <code@bryantluk.com>"]
+description = "Another WebAssembly interpreter."
+documentation = "https://docs.rs/wanwan/"
+edition = "2021"
+include = [
+  "src/**/*.rs",
+  "Cargo.toml",
+  "README.md",
+  "CHANGELOG.md",
+  "LICENSE-APACHE",
+  "LICENSE-MIT",
+]
+license = "MIT OR Apache-2.0"
+name = "wanwan"
+publish = false
+readme = "README.md"
+repository = "https://github.com/bluk/wanwan"
+rust-version = "1.65.0"
+version = "0.1.0"
+
+[dependencies]
+
+[features]
+default = ["std"]
+
+std = []
+
+alloc = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
