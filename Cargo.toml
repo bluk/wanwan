@@ -21,6 +21,9 @@ version = "0.1.0"
 
 [dependencies]
 
+[dev-dependencies]
+proptest = "1.2.0"
+
 [features]
 default = ["std"]
 
