@@ -19,12 +19,23 @@ use std::{
     vec::Vec,
 };
 
-use crate::module::{
-    instr::{BlockTy, Expr, Instr, MemArg},
-    ty::{FuncTy, GlobalTy, Limits, MemoryTy, Mut, NumTy, RefTy, ResultTy, TableTy, ValTy, VecTy},
-    Data, DataIndex, DataMode, Elem, ElementIndex, ElementSegmentMode, Export, ExportDesc,
-    FuncIndex, Global, GlobalIndex, Import, ImportDesc, LabelIndex, LocalIndex, Mem, MemIndex,
-    Module, Table, TableIndex, TypeIndex,
+use crate::{
+    module::{
+        instr::{BlockTy, ConstExpr, ConstInstr, Expr, Instr, MemArg},
+        ty::{
+            FuncTy, GlobalTy, Limits, MemoryTy, Mut, NumTy, RefTy, ResultTy, TableTy, ValTy, VecTy,
+        },
+        Data, DataIndex, DataMode, Elem, ElementIndex, ElementSegmentMode, Export, ExportDesc,
+        FuncIndex, Global, GlobalIndex, Import, ImportDesc, ImportGlobalIndex, LabelIndex,
+        LocalIndex, Mem, MemIndex, Module, Table, TableIndex, TypeIndex,
+    },
+    validation::{
+        CodeSectionValidator, ConstExprValidator, DataContext, DataSectionValidator,
+        ElementsContext, ElementsSectionValidator, ExportsSectionValidator, ExprError,
+        FunctionSectionValidator, FunctionsContext, GlobalSectionValidator, GlobalsContext,
+        ImportGlobalsContext, ImportSectionValidator, MemsContext, OpdTy, StartSectionValidator,
+        TablesContext, TypesContext,
+    },
 };
 
 mod leb128;
@@ -185,6 +196,9 @@ impl Limits {
     where
         R: Read,
     {
+        // XXX: Should have a maximum limit supported by the runtime and ensure
+        // both the minimum and maximum are not larger.
+
         let max_present = match reader.next()? {
             0x00 => false,
             0x01 => true,
@@ -195,6 +209,13 @@ impl Limits {
 
         let n = decode_u32(reader)?;
         let m = max_present.then(|| decode_u32(reader)).transpose()?;
+
+        if let Some(m) = m {
+            if m > n {
+                return Err(DecodeError::InvalidLimits);
+            }
+        }
+
         Ok(Self { min: n, max: m })
     }
 }
@@ -204,9 +225,18 @@ impl MemoryTy {
     where
         R: Read,
     {
-        Ok(Self {
-            lim: Limits::decode(reader)?,
-        })
+        let lim = Limits::decode(reader)?;
+        if lim.min > 2u32.pow(16) {
+            return Err(DecodeError::InvalidMemoryTy);
+        }
+
+        if let Some(max) = lim.max {
+            if max > 2u32.pow(16) {
+                return Err(DecodeError::InvalidMemoryTy);
+            }
+        }
+
+        Ok(Self { lim })
     }
 }
 
@@ -248,25 +278,31 @@ impl GlobalTy {
 }
 
 impl BlockTy {
-    fn decode<R>(reader: &mut R) -> Result<Self, DecodeError<R::Error>>
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
     where
         R: Read,
+        C: TypesContext,
     {
         let peek = reader.peek()?;
         if peek == 0x40 {
             reader.next()?;
-            return Ok(Self::Empty);
+            return Ok(Self::Val(None));
         }
 
         if let Ok(val_ty) = ValTy::decode_u8::<R>(peek) {
             reader.next()?;
-            return Ok(Self::Val(val_ty));
+            return Ok(Self::Val(Some(val_ty)));
         }
 
-        decode_s33_block_ty(reader)
+        let ty_idx = decode_s33_block_ty(reader)
             .and_then(|ty_idx| u32::try_from(ty_idx).map_err(|_| DecodeError::InvalidNum))
-            .map(TypeIndex)
-            .map(Self::Index)
+            .map(TypeIndex)?;
+
+        if !ctx.is_type_valid(ty_idx) {
+            return Err(DecodeError::InvalidTypeIndex);
+        }
+
+        Ok(Self::Index(ty_idx))
     }
 }
 
@@ -289,9 +325,19 @@ const OP_CODE_ELSE: u8 = 0x05;
 
 impl Instr {
     #[allow(clippy::too_many_lines)]
-    fn decode_with_op_code<R>(op_code: u8, reader: &mut R) -> Result<Self, DecodeError<R::Error>>
+    fn decode_with_op_code<R, C>(
+        op_code: u8,
+        reader: &mut R,
+        ctx: &C,
+    ) -> Result<Self, DecodeError<R::Error>>
     where
         R: Read,
+        C: TypesContext
+            + FunctionsContext
+            + TablesContext
+            + GlobalsContext
+            + ElementsContext
+            + DataContext,
     {
         use crate::module::instr::{
             Const, Control, CvtOp, FBinOp, FRelOp, FUnOp, FloatTy, IBinOp, IRelOp, ITestOp, IUnOp,
@@ -304,22 +350,22 @@ impl Instr {
             0x00 => Self::Control(Control::Unreachable),
             0x01 => Self::Control(Control::Nop),
             0x02 => {
-                let bt = BlockTy::decode(reader)?;
-                let (instrs, _) = Self::decode_until(reader, &[OP_CODE_END])?;
+                let bt = BlockTy::decode(reader, ctx)?;
+                let (instrs, _) = Self::decode_until(reader, &[OP_CODE_END], ctx)?;
                 Self::Control(Control::Block { bt, instrs })
             }
             0x03 => {
-                let bt = BlockTy::decode(reader)?;
-                let (instrs, _) = Self::decode_until(reader, &[OP_CODE_END])?;
+                let bt = BlockTy::decode(reader, ctx)?;
+                let (instrs, _) = Self::decode_until(reader, &[OP_CODE_END], ctx)?;
                 Self::Control(Control::Loop { bt, instrs })
             }
             0x04 => {
-                let bt = BlockTy::decode(reader)?;
-                let (then, end) = Self::decode_until(reader, &[OP_CODE_ELSE, OP_CODE_END])?;
+                let bt = BlockTy::decode(reader, ctx)?;
+                let (then, end) = Self::decode_until(reader, &[OP_CODE_ELSE, OP_CODE_END], ctx)?;
                 let el = if end == OP_CODE_END {
                     Vec::new()
                 } else {
-                    let (instrs, _) = Self::decode_until(reader, &[OP_CODE_END])?;
+                    let (instrs, _) = Self::decode_until(reader, &[OP_CODE_END], ctx)?;
                     instrs
                 };
                 Self::Control(Control::If { bt, then, el })
@@ -339,12 +385,12 @@ impl Instr {
             }
             0x0f => Self::Control(Control::Return),
             0x10 => {
-                let idx = FuncIndex::decode(reader)?;
+                let idx = FuncIndex::decode(reader, ctx)?;
                 Self::Control(Control::Call(idx))
             }
             0x11 => {
-                let y = TypeIndex::decode(reader)?;
-                let x = TableIndex::decode(reader)?;
+                let y = TypeIndex::decode(reader, ctx)?;
+                let x = TableIndex::decode(reader, ctx)?;
                 Self::Control(Control::CallIndirect { y, x })
             }
 
@@ -355,7 +401,7 @@ impl Instr {
             }
             0xd1 => Self::Ref(Ref::RefIsNull),
             0xd2 => {
-                let x = FuncIndex::decode(reader)?;
+                let x = FuncIndex::decode(reader, ctx)?;
                 Self::Ref(Ref::RefFunc(x))
             }
 
@@ -381,21 +427,21 @@ impl Instr {
                 Self::Var(Variable::LocalTee(x))
             }
             0x23 => {
-                let x = GlobalIndex::decode(reader)?;
+                let x = GlobalIndex::decode(reader, ctx)?;
                 Self::Var(Variable::GlobalGet(x))
             }
             0x24 => {
-                let x = GlobalIndex::decode(reader)?;
+                let x = GlobalIndex::decode(reader, ctx)?;
                 Self::Var(Variable::GlobalSet(x))
             }
 
             // Table Instructions
             0x25 => {
-                let x = TableIndex::decode(reader)?;
+                let x = TableIndex::decode(reader, ctx)?;
                 Self::Table(Table::TableGet(x))
             }
             0x26 => {
-                let x = TableIndex::decode(reader)?;
+                let x = TableIndex::decode(reader, ctx)?;
                 Self::Table(Table::TableSet(x))
             }
 
@@ -925,7 +971,7 @@ impl Instr {
 
                 // Memory Instructions
                 8 => {
-                    let x = DataIndex::decode(reader)?;
+                    let x = DataIndex::decode(reader, ctx)?;
                     match reader.next()? {
                         0x00 => {}
                         _ => return Err(DecodeError::InvalidInstr),
@@ -933,7 +979,7 @@ impl Instr {
                     Self::Mem(Mem::MemoryInit(x))
                 }
                 9 => {
-                    let x = DataIndex::decode(reader)?;
+                    let x = DataIndex::decode(reader, ctx)?;
                     Self::Mem(Mem::DataDrop(x))
                 }
                 10 => {
@@ -958,29 +1004,29 @@ impl Instr {
 
                 // Table Instructions
                 12 => {
-                    let y = ElementIndex::decode(reader)?;
-                    let x = TableIndex::decode(reader)?;
+                    let y = ElementIndex::decode(reader, ctx)?;
+                    let x = TableIndex::decode(reader, ctx)?;
                     Self::Table(Table::TableInit { elem: y, table: x })
                 }
                 13 => {
-                    let x = ElementIndex::decode(reader)?;
+                    let x = ElementIndex::decode(reader, ctx)?;
                     Self::Table(Table::ElemDrop(x))
                 }
                 14 => {
-                    let x = TableIndex::decode(reader)?;
-                    let y = TableIndex::decode(reader)?;
+                    let x = TableIndex::decode(reader, ctx)?;
+                    let y = TableIndex::decode(reader, ctx)?;
                     Self::Table(Table::TableCopy { x, y })
                 }
                 15 => {
-                    let x = TableIndex::decode(reader)?;
+                    let x = TableIndex::decode(reader, ctx)?;
                     Self::Table(Table::TableGrow(x))
                 }
                 16 => {
-                    let x = TableIndex::decode(reader)?;
+                    let x = TableIndex::decode(reader, ctx)?;
                     Self::Table(Table::TableSize(x))
                 }
                 17 => {
-                    let x = TableIndex::decode(reader)?;
+                    let x = TableIndex::decode(reader, ctx)?;
                     Self::Table(Table::TableFill(x))
                 }
                 _ => return Err(DecodeError::InvalidInstr),
@@ -994,12 +1040,19 @@ impl Instr {
         })
     }
 
-    fn decode_until<R>(
+    fn decode_until<R, C>(
         reader: &mut R,
         terms: &[u8],
+        ctx: &C,
     ) -> Result<(Vec<Self>, u8), DecodeError<R::Error>>
     where
         R: Read,
+        C: TypesContext
+            + FunctionsContext
+            + TablesContext
+            + GlobalsContext
+            + ElementsContext
+            + DataContext,
     {
         debug_assert!(!terms.is_empty());
 
@@ -1012,7 +1065,7 @@ impl Instr {
                 break;
             }
 
-            let instr = Self::decode_with_op_code(op_code, reader)?;
+            let instr = Self::decode_with_op_code(op_code, reader, ctx)?;
             instrs.push(instr);
         }
 
@@ -1020,13 +1073,264 @@ impl Instr {
     }
 }
 
-impl Expr {
-    fn decode<R>(reader: &mut R) -> Result<Self, DecodeError<R::Error>>
+impl ConstInstr {
+    fn decode_with_op_code<R, C>(
+        op_code: u8,
+        reader: &mut R,
+        ctx: &C,
+        validator: &mut ConstExprValidator,
+    ) -> Result<Self, DecodeError<R::Error>>
     where
         R: Read,
+        C: ImportGlobalsContext + FunctionsContext,
     {
-        let (instrs, _) = Instr::decode_until(reader, &[OP_CODE_END])?;
+        use crate::module::instr::Const;
+
+        Ok(match op_code {
+            // Reference Instructions
+            0xd0 => {
+                let t = RefTy::decode(reader)?;
+
+                validator.push_val(OpdTy::Ref(t));
+
+                Self::RefNull(t)
+            }
+            0xd2 => {
+                let x = FuncIndex::decode(reader, ctx)?;
+
+                validator.push_val(OpdTy::Ref(RefTy::FuncRef));
+
+                Self::RefFunc(x)
+            }
+
+            // Variable Instructions
+            0x23 => {
+                let x = ImportGlobalIndex::decode(reader, ctx)?;
+
+                // XXX: This is checking for the import twice since decode above does it.
+                let global_ty = ctx.import_global_ty(x).unwrap();
+                validator.push_val(global_ty.t.into());
+
+                Self::GlobalGet(x)
+            }
+
+            // Numeric Instructions
+            0x41 => {
+                let n = decode_s32(reader)?;
+
+                validator.push_val(OpdTy::Num(NumTy::I32));
+
+                Self::Constant(Const::I32(n))
+            }
+            0x42 => {
+                let n = decode_s64(reader)?;
+
+                validator.push_val(OpdTy::Num(NumTy::I64));
+
+                Self::Constant(Const::I64(n))
+            }
+            0x43 => {
+                let n = decode_f32(reader)?;
+
+                validator.push_val(OpdTy::Num(NumTy::F32));
+
+                Self::Constant(Const::F32(n))
+            }
+            0x44 => {
+                let n = decode_f64(reader)?;
+
+                validator.push_val(OpdTy::Num(NumTy::F64));
+
+                Self::Constant(Const::F64(n))
+            }
+            _ => return Err(DecodeError::InvalidConstInstr),
+        })
+    }
+
+    fn decode_until<R, C>(
+        reader: &mut R,
+        ctx: &C,
+        validator: &mut ConstExprValidator,
+    ) -> Result<Vec<Self>, DecodeError<R::Error>>
+    where
+        R: Read,
+        C: ImportGlobalsContext + FunctionsContext,
+    {
+        let mut instrs = Vec::new();
+        let mut op_code;
+
+        loop {
+            op_code = reader.next()?;
+            if op_code == OP_CODE_END {
+                validator.end()?;
+                break;
+            }
+
+            let instr = Self::decode_with_op_code(op_code, reader, ctx, validator)?;
+            instrs.push(instr);
+        }
+
+        Ok(instrs)
+    }
+}
+
+impl Expr {
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
+    where
+        R: Read,
+        C: TypesContext
+            + FunctionsContext
+            + TablesContext
+            + GlobalsContext
+            + ElementsContext
+            + DataContext,
+    {
+        let (instrs, _) = Instr::decode_until(reader, &[OP_CODE_END], ctx)?;
         Ok(Self { instrs })
+    }
+}
+
+impl ConstExpr {
+    fn decode<R, C>(
+        reader: &mut R,
+        ctx: &C,
+        expected_ty: OpdTy,
+    ) -> Result<Self, DecodeError<R::Error>>
+    where
+        R: Read,
+        C: ImportGlobalsContext + FunctionsContext,
+    {
+        let mut validator = ConstExprValidator::new(expected_ty);
+        let instrs = ConstInstr::decode_until(reader, ctx, &mut validator)?;
+        debug_assert_eq!(validator.into_final_ty(), vec![expected_ty]);
+
+        Ok(Self { instrs })
+    }
+}
+
+impl TypeIndex {
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
+    where
+        R: Read,
+        C: TypesContext,
+    {
+        let idx = Self(decode_u32(reader)?);
+        if !ctx.is_type_valid(idx) {
+            return Err(DecodeError::InvalidTypeIndex);
+        }
+
+        Ok(idx)
+    }
+}
+
+impl ImportGlobalIndex {
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
+    where
+        R: Read,
+        C: ImportGlobalsContext,
+    {
+        let idx = Self(decode_u32(reader)?);
+        let Some(import_ty) = ctx.import_global_ty(idx) else {
+            return Err(DecodeError::InvalidGlobalIndex);
+        };
+        match import_ty.m {
+            Mut::Const => {}
+            Mut::Var => {
+                return Err(DecodeError::InvalidGlobalIndex);
+            }
+        }
+
+        Ok(idx)
+    }
+}
+
+impl FuncIndex {
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
+    where
+        R: Read,
+        C: FunctionsContext,
+    {
+        let idx = Self(decode_u32(reader)?);
+        if !ctx.is_func_valid(idx) {
+            return Err(DecodeError::InvalidFuncIndex);
+        }
+
+        Ok(idx)
+    }
+}
+
+impl TableIndex {
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
+    where
+        R: Read,
+        C: TablesContext,
+    {
+        let idx = Self(decode_u32(reader)?);
+        if !ctx.is_table_valid(idx) {
+            return Err(DecodeError::InvalidTableIndex);
+        }
+
+        Ok(idx)
+    }
+}
+
+impl MemIndex {
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
+    where
+        R: Read,
+        C: MemsContext,
+    {
+        let idx = Self(decode_u32(reader)?);
+        if !ctx.is_mem_valid(idx) {
+            return Err(DecodeError::InvalidMemIndex);
+        }
+
+        Ok(idx)
+    }
+}
+
+impl GlobalIndex {
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
+    where
+        R: Read,
+        C: GlobalsContext,
+    {
+        let idx = Self(decode_u32(reader)?);
+        if !ctx.is_global_valid(idx) {
+            return Err(DecodeError::InvalidGlobalIndex);
+        }
+
+        Ok(idx)
+    }
+}
+
+impl ElementIndex {
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
+    where
+        R: Read,
+        C: ElementsContext,
+    {
+        let idx = Self(decode_u32(reader)?);
+        if !ctx.is_elem_valid(idx) {
+            return Err(DecodeError::InvalidElementIndex);
+        }
+
+        Ok(idx)
+    }
+}
+
+impl DataIndex {
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
+    where
+        R: Read,
+        C: DataContext,
+    {
+        let idx = Self(decode_u32(reader)?);
+        if !ctx.is_data_valid(idx) {
+            return Err(DecodeError::InvalidDataIndex);
+        }
+
+        Ok(idx)
     }
 }
 
@@ -1043,23 +1347,17 @@ macro_rules! decode_idx {
     };
 }
 
-decode_idx!(TypeIndex);
-decode_idx!(TableIndex);
-decode_idx!(FuncIndex);
-decode_idx!(MemIndex);
-decode_idx!(GlobalIndex);
-decode_idx!(ElementIndex);
-decode_idx!(DataIndex);
 decode_idx!(LocalIndex);
 decode_idx!(LabelIndex);
 
 impl ImportDesc {
-    fn decode<R>(reader: &mut R) -> Result<Self, DecodeError<R::Error>>
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
     where
         R: Read,
+        C: TypesContext,
     {
         match reader.next()? {
-            0x00 => Ok(Self::Func(TypeIndex::decode(reader)?)),
+            0x00 => Ok(Self::Func(TypeIndex::decode(reader, ctx)?)),
             0x01 => Ok(Self::Table(TableTy::decode(reader)?)),
             0x02 => Ok(Self::Mem(MemoryTy::decode(reader)?)),
             0x03 => Ok(Self::Global(GlobalTy::decode(reader)?)),
@@ -1069,13 +1367,14 @@ impl ImportDesc {
 }
 
 impl Import {
-    fn decode<R>(reader: &mut R) -> Result<Self, DecodeError<R::Error>>
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
     where
         R: Read,
+        C: TypesContext,
     {
         let module = decode_name(reader)?;
         let nm = decode_name(reader)?;
-        let d = ImportDesc::decode(reader)?;
+        let d = ImportDesc::decode(reader, ctx)?;
 
         Ok(Self {
             module,
@@ -1086,39 +1385,42 @@ impl Import {
 }
 
 impl Global {
-    fn decode<R>(reader: &mut R) -> Result<Self, DecodeError<R::Error>>
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
     where
         R: Read,
+        C: ImportGlobalsContext + FunctionsContext,
     {
         let gt = GlobalTy::decode(reader)?;
-        let e = Expr::decode(reader)?;
+        let e = ConstExpr::decode(reader, ctx, gt.t.into())?;
 
         Ok(Self { ty: gt, init: e })
     }
 }
 
 impl ExportDesc {
-    fn decode<R>(reader: &mut R) -> Result<Self, DecodeError<R::Error>>
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
     where
         R: Read,
+        C: FunctionsContext + TablesContext + MemsContext + GlobalsContext,
     {
         match reader.next()? {
-            0x00 => Ok(Self::Func(FuncIndex::decode(reader)?)),
-            0x01 => Ok(Self::Table(TableIndex::decode(reader)?)),
-            0x02 => Ok(Self::Mem(MemIndex::decode(reader)?)),
-            0x03 => Ok(Self::Global(GlobalIndex::decode(reader)?)),
-            _ => Err(DecodeError::InvalidImportDesc),
+            0x00 => Ok(Self::Func(FuncIndex::decode(reader, ctx)?)),
+            0x01 => Ok(Self::Table(TableIndex::decode(reader, ctx)?)),
+            0x02 => Ok(Self::Mem(MemIndex::decode(reader, ctx)?)),
+            0x03 => Ok(Self::Global(GlobalIndex::decode(reader, ctx)?)),
+            _ => Err(DecodeError::InvalidExportDesc),
         }
     }
 }
 
 impl Export {
-    fn decode<R>(reader: &mut R) -> Result<Self, DecodeError<R::Error>>
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
     where
         R: Read,
+        C: FunctionsContext + TablesContext + MemsContext + GlobalsContext,
     {
         let nm = decode_name(reader)?;
-        let d = ExportDesc::decode(reader)?;
+        let d = ExportDesc::decode(reader, ctx)?;
 
         Ok(Self { name: nm, desc: d })
     }
@@ -1141,52 +1443,58 @@ impl ElemKind {
 }
 
 impl Elem {
-    fn decode<R>(reader: &mut R) -> Result<Self, DecodeError<R::Error>>
+    #[allow(clippy::too_many_lines)]
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
     where
         R: Read,
+        C: ImportGlobalsContext + FunctionsContext + TablesContext,
     {
-        use crate::module::instr::Ref;
+        // XXX: Could optimize ConstExpr to hold single instruction instead of Vec<ConstInstr>
 
         match decode_u32(reader)? {
             0 => {
-                let e = Expr::decode(reader)?;
-                let y = decode_vec(reader, FuncIndex::decode)?;
+                let e = ConstExpr::decode(reader, ctx, OpdTy::Num(NumTy::I32))?;
+                let y = decode_vec(reader, |r| FuncIndex::decode(r, ctx))?;
+                let x = TableIndex(0);
+                if !ctx.is_table_valid(x) {
+                    return Err(DecodeError::InvalidTableIndex);
+                }
                 Ok(Self {
                     ty: RefTy::FuncRef,
                     init: y
                         .into_iter()
-                        .map(|idx| Expr {
-                            instrs: vec![Instr::Ref(Ref::RefFunc(idx))],
+                        .map(|idx| ConstExpr {
+                            instrs: vec![ConstInstr::RefFunc(idx)],
                         })
                         .collect(),
-                    mode: ElementSegmentMode::Active(TableIndex(0), e),
+                    mode: ElementSegmentMode::Active(x, e),
                 })
             }
             1 => {
                 let _ = ElemKind::decode(reader)?;
-                let y = decode_vec(reader, FuncIndex::decode)?;
+                let y = decode_vec(reader, |r| FuncIndex::decode(r, ctx))?;
                 Ok(Self {
                     ty: RefTy::FuncRef,
                     init: y
                         .into_iter()
-                        .map(|idx| Expr {
-                            instrs: vec![Instr::Ref(Ref::RefFunc(idx))],
+                        .map(|idx| ConstExpr {
+                            instrs: vec![ConstInstr::RefFunc(idx)],
                         })
                         .collect(),
                     mode: ElementSegmentMode::Passive,
                 })
             }
             2 => {
-                let x = TableIndex::decode(reader)?;
-                let e = Expr::decode(reader)?;
+                let x = TableIndex::decode(reader, ctx)?;
+                let e = ConstExpr::decode(reader, ctx, OpdTy::Num(NumTy::I32))?;
                 let _ = ElemKind::decode(reader)?;
-                let y = decode_vec(reader, FuncIndex::decode)?;
+                let y = decode_vec(reader, |r| FuncIndex::decode(r, ctx))?;
                 Ok(Self {
                     ty: RefTy::FuncRef,
                     init: y
                         .into_iter()
-                        .map(|idx| Expr {
-                            instrs: vec![Instr::Ref(Ref::RefFunc(idx))],
+                        .map(|idx| ConstExpr {
+                            instrs: vec![ConstInstr::RefFunc(idx)],
                         })
                         .collect(),
                     mode: ElementSegmentMode::Active(x, e),
@@ -1194,30 +1502,36 @@ impl Elem {
             }
             3 => {
                 let _ = ElemKind::decode(reader)?;
-                let y = decode_vec(reader, FuncIndex::decode)?;
+                let y = decode_vec(reader, |r| FuncIndex::decode(r, ctx))?;
                 Ok(Self {
                     ty: RefTy::FuncRef,
                     init: y
                         .into_iter()
-                        .map(|idx| Expr {
-                            instrs: vec![Instr::Ref(Ref::RefFunc(idx))],
+                        .map(|idx| ConstExpr {
+                            instrs: vec![ConstInstr::RefFunc(idx)],
                         })
                         .collect(),
                     mode: ElementSegmentMode::Declarative,
                 })
             }
             4 => {
-                let e = Expr::decode(reader)?;
-                let el = decode_vec(reader, Expr::decode)?;
+                let e = ConstExpr::decode(reader, ctx, OpdTy::Num(NumTy::I32))?;
+                let el = decode_vec(reader, |r| {
+                    ConstExpr::decode(r, ctx, OpdTy::Ref(RefTy::FuncRef))
+                })?;
+                let x = TableIndex(0);
+                if !ctx.is_table_valid(x) {
+                    return Err(DecodeError::InvalidTableIndex);
+                }
                 Ok(Self {
                     ty: RefTy::FuncRef,
                     init: el,
-                    mode: ElementSegmentMode::Active(TableIndex(0), e),
+                    mode: ElementSegmentMode::Active(x, e),
                 })
             }
             5 => {
                 let et = RefTy::decode(reader)?;
-                let el = decode_vec(reader, Expr::decode)?;
+                let el = decode_vec(reader, |r| ConstExpr::decode(r, ctx, OpdTy::Ref(et)))?;
                 Ok(Self {
                     ty: et,
                     init: el,
@@ -1225,10 +1539,10 @@ impl Elem {
                 })
             }
             6 => {
-                let x = TableIndex::decode(reader)?;
-                let e = Expr::decode(reader)?;
+                let x = TableIndex::decode(reader, ctx)?;
+                let e = ConstExpr::decode(reader, ctx, OpdTy::Num(NumTy::I32))?;
                 let et = RefTy::decode(reader)?;
-                let el = decode_vec(reader, Expr::decode)?;
+                let el = decode_vec(reader, |r| ConstExpr::decode(r, ctx, OpdTy::Ref(et)))?;
                 Ok(Self {
                     ty: et,
                     init: el,
@@ -1237,7 +1551,7 @@ impl Elem {
             }
             7 => {
                 let et = RefTy::decode(reader)?;
-                let el = decode_vec(reader, Expr::decode)?;
+                let el = decode_vec(reader, |r| ConstExpr::decode(r, ctx, OpdTy::Ref(et)))?;
                 Ok(Self {
                     ty: et,
                     init: el,
@@ -1273,14 +1587,20 @@ struct Func {
 }
 
 impl Func {
-    fn decode<R>(reader: &mut R) -> Result<Self, DecodeError<R::Error>>
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
     where
         R: Read,
+        C: TypesContext
+            + FunctionsContext
+            + TablesContext
+            + GlobalsContext
+            + ElementsContext
+            + DataContext,
     {
         // XXX: Can optimize this by decoding into the concatenated Vec immediately
 
         let locals = decode_vec(reader, Locals::decode)?;
-        let e = Expr::decode(reader)?;
+        let e = Expr::decode(reader, ctx)?;
 
         let capacity = usize::try_from(locals.iter().map(|l| u64::from(l.n)).sum::<u64>()).unwrap();
         let mut t = Vec::with_capacity(capacity);
@@ -1298,14 +1618,20 @@ struct Code {
 }
 
 impl Code {
-    fn decode<R>(reader: &mut R) -> Result<Self, DecodeError<R::Error>>
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
     where
         R: Read,
+        C: TypesContext
+            + FunctionsContext
+            + TablesContext
+            + GlobalsContext
+            + ElementsContext
+            + DataContext,
     {
         let size = decode_u32(reader)?;
         let expected_pos = reader.pos() + u64::from(size);
 
-        let code = Func::decode(reader)?;
+        let code = Func::decode(reader, ctx)?;
 
         // Early detection of error
         if reader.pos() != expected_pos {
@@ -1317,17 +1643,22 @@ impl Code {
 }
 
 impl Data {
-    fn decode<R>(reader: &mut R) -> Result<Self, DecodeError<R::Error>>
+    fn decode<R, C>(reader: &mut R, ctx: &C) -> Result<Self, DecodeError<R::Error>>
     where
         R: Read,
+        C: ImportGlobalsContext + FunctionsContext + MemsContext,
     {
         match decode_u32(reader)? {
             0 => {
-                let e = Expr::decode(reader)?;
+                let e = ConstExpr::decode(reader, ctx, OpdTy::Num(NumTy::I32))?;
                 let b = decode_bytes_vec(reader)?;
+                let x = MemIndex(0);
+                if !ctx.is_mem_valid(x) {
+                    return Err(DecodeError::InvalidMemIndex);
+                }
                 Ok(Self {
                     init: b,
-                    mode: DataMode::Active(MemIndex(0), e),
+                    mode: DataMode::Active(x, e),
                 })
             }
             1 => {
@@ -1338,8 +1669,8 @@ impl Data {
                 })
             }
             2 => {
-                let x = MemIndex::decode(reader)?;
-                let e = Expr::decode(reader)?;
+                let x = MemIndex::decode(reader, ctx)?;
+                let e = ConstExpr::decode(reader, ctx, OpdTy::Num(NumTy::I32))?;
                 let b = decode_bytes_vec(reader)?;
                 Ok(Self {
                     init: b,
@@ -1466,6 +1797,10 @@ impl Module {
 
         let mut types = Vec::new();
         let mut imports = Vec::new();
+        let mut import_funcs = Vec::new();
+        let mut import_tables = Vec::new();
+        let mut import_mems = Vec::new();
+        let mut import_globals = Vec::new();
         let mut type_idxs = Vec::new();
         let mut tables = Vec::new();
         let mut mems = Vec::new();
@@ -1500,10 +1835,34 @@ impl Module {
                     types = decode_vec(reader, FuncTy::decode)?;
                 }
                 SectionId::Import => {
-                    imports = decode_vec(reader, Import::decode)?;
+                    let ctx = ImportSectionValidator { types: &types };
+                    imports = decode_vec(reader, |r| Import::decode(r, &ctx))?;
+
+                    import_funcs = Vec::new();
+                    import_tables = Vec::new();
+                    import_mems = Vec::new();
+                    import_globals = Vec::new();
+
+                    for i in &imports {
+                        match i.desc {
+                            ImportDesc::Func(ty_idx) => {
+                                import_funcs.push(ty_idx);
+                            }
+                            ImportDesc::Table(tbl) => {
+                                import_tables.push(tbl);
+                            }
+                            ImportDesc::Mem(m) => {
+                                import_mems.push(m);
+                            }
+                            ImportDesc::Global(g) => {
+                                import_globals.push(g);
+                            }
+                        }
+                    }
                 }
                 SectionId::Function => {
-                    type_idxs = decode_vec(reader, TypeIndex::decode)?;
+                    let ctx = FunctionSectionValidator { types: &types };
+                    type_idxs = decode_vec(reader, |r| TypeIndex::decode(r, &ctx))?;
                 }
                 SectionId::Table => {
                     tables = decode_vec(reader, TableTy::decode)?
@@ -1516,24 +1875,76 @@ impl Module {
                         .into_iter()
                         .map(|mt| Mem { ty: mt })
                         .collect();
+                    if mems.len() > 1 {
+                        return Err(DecodeError::InvalidMemCount);
+                    }
                 }
                 SectionId::Global => {
-                    globals = decode_vec(reader, Global::decode)?;
+                    let ctx = GlobalSectionValidator {
+                        import_funcs: &import_funcs,
+                        import_globals: &import_globals,
+                        type_idxs: &type_idxs,
+                    };
+                    globals = decode_vec(reader, |r| Global::decode(r, &ctx))?;
                 }
                 SectionId::Export => {
-                    exports = decode_vec(reader, Export::decode)?;
+                    let ctx = ExportsSectionValidator {
+                        import_funcs: &import_funcs,
+                        import_tables: &import_tables,
+                        import_mems: &import_mems,
+                        import_globals: &import_globals,
+                        type_idxs: &type_idxs,
+                        tables: &tables,
+                        mems: &mems,
+                        globals: &globals,
+                    };
+                    exports = decode_vec(reader, |r| Export::decode(r, &ctx))?;
+                    // TODO: Validate all export names are unique
                 }
                 SectionId::Start => {
-                    start = Some(FuncIndex::decode(reader)?);
+                    let ctx = StartSectionValidator {
+                        types: &types,
+                        import_funcs: &import_funcs,
+                        type_idxs: &type_idxs,
+                    };
+                    let idx = FuncIndex::decode(reader, &ctx)?;
+                    let Some(ty_idx) = ctx.type_index(idx) else {
+                        return Err(DecodeError::InvalidStart);
+                    };
+                    let Some(func_ty) = ctx.func_ty(ty_idx) else {
+                        return Err(DecodeError::InvalidStart);
+                    };
+                    if !func_ty.is_params_empty() || !func_ty.is_return_empty() {
+                        return Err(DecodeError::InvalidStart);
+                    }
+                    start = Some(idx);
                 }
                 SectionId::Element => {
-                    elems = decode_vec(reader, Elem::decode)?;
+                    let ctx = ElementsSectionValidator {
+                        import_funcs: &import_funcs,
+                        import_tables: &import_tables,
+                        import_globals: &import_globals,
+                        type_idxs: &type_idxs,
+                        tables: &tables,
+                    };
+                    elems = decode_vec(reader, |r| Elem::decode(r, &ctx))?;
                 }
                 SectionId::DataCount => {
                     datacount = Some(decode_u32(reader)?);
                 }
                 SectionId::Code => {
-                    code = decode_vec(reader, Code::decode)?;
+                    let ctx = CodeSectionValidator {
+                        types: &types,
+                        import_funcs: &import_funcs,
+                        import_tables: &import_tables,
+                        import_globals: &import_globals,
+                        type_idxs: &type_idxs,
+                        tables: &tables,
+                        globals: &globals,
+                        elems: &elems,
+                        data_len: datacount,
+                    };
+                    code = decode_vec(reader, |r| Code::decode(r, &ctx))?;
 
                     // Early exit possible, but still need to check at the end.
                     if type_idxs.len() != code.len() {
@@ -1542,7 +1953,15 @@ impl Module {
                 }
                 SectionId::Data => {
                     // XXX: If data section exists, then datacount MUST exist in Wasm 2.
-                    datas = decode_vec(reader, Data::decode)?;
+
+                    let ctx = DataSectionValidator {
+                        import_funcs: &import_funcs,
+                        import_mems: &import_mems,
+                        import_globals: &import_globals,
+                        type_idxs: &type_idxs,
+                        mems: &mems,
+                    };
+                    datas = decode_vec(reader, |r| Data::decode(r, &ctx))?;
                     // XXX: Data count MUST match with the datas size in Wasm 2
                     if let Some(datacount) = datacount {
                         if datas.len() != usize::try_from(datacount).unwrap() {
@@ -1599,27 +2018,46 @@ enum DecodeError<E> {
     InvalidValueTy,
     InvalidFuncTy,
     InvalidLimits,
+    InvalidMemoryTy,
     InvalidInstr,
+    InvalidConstInstr,
     InvalidMut,
     InvalidImportDesc,
+    InvalidExportDesc,
     InvalidElementSegment,
     InvalidData,
     InvalidSection,
+    InvalidTypeIndex,
+    InvalidFuncIndex,
+    InvalidTableIndex,
+    InvalidMemIndex,
+    InvalidGlobalIndex,
+    InvalidElementIndex,
+    InvalidDataIndex,
     InvalidPreamble,
     InvalidModule,
+    InvalidMemCount,
+    InvalidStart,
+    InvalidExpr(ExprError),
     InvalidName(FromUtf8Error),
     Read(ReadError<E>),
-}
-
-impl<E> From<ReadError<E>> for DecodeError<E> {
-    fn from(value: ReadError<E>) -> Self {
-        Self::Read(value)
-    }
 }
 
 impl<E> From<FromUtf8Error> for DecodeError<E> {
     fn from(value: FromUtf8Error) -> Self {
         Self::InvalidName(value)
+    }
+}
+
+impl<E> From<ExprError> for DecodeError<E> {
+    fn from(value: ExprError) -> Self {
+        Self::InvalidExpr(value)
+    }
+}
+
+impl<E> From<ReadError<E>> for DecodeError<E> {
+    fn from(value: ReadError<E>) -> Self {
+        Self::Read(value)
     }
 }
 
@@ -1652,14 +2090,27 @@ where
             DecodeError::InvalidValueTy => f.write_str("invalid value type"),
             DecodeError::InvalidFuncTy => f.write_str("invalid function type"),
             DecodeError::InvalidLimits => f.write_str("invalid limits"),
+            DecodeError::InvalidMemoryTy => f.write_str("invalid memory type"),
             DecodeError::InvalidInstr => f.write_str("invalid instruction"),
+            DecodeError::InvalidConstInstr => f.write_str("invalid constant instruction"),
             DecodeError::InvalidMut => f.write_str("invalid mutability"),
             DecodeError::InvalidImportDesc => f.write_str("invalid import description"),
+            DecodeError::InvalidExportDesc => f.write_str("invalid export description"),
             DecodeError::InvalidElementSegment => f.write_str("invalid element segment"),
             DecodeError::InvalidData => f.write_str("invalid data section"),
+            DecodeError::InvalidTypeIndex => f.write_str("invalid type index"),
+            DecodeError::InvalidFuncIndex => f.write_str("invalid function index"),
+            DecodeError::InvalidTableIndex => f.write_str("invalid table index"),
+            DecodeError::InvalidMemIndex => f.write_str("invalid memory index"),
+            DecodeError::InvalidGlobalIndex => f.write_str("invalid global index"),
+            DecodeError::InvalidElementIndex => f.write_str("invalid element index"),
+            DecodeError::InvalidDataIndex => f.write_str("invalid data index"),
             DecodeError::InvalidSection => f.write_str("invalid section"),
             DecodeError::InvalidPreamble => f.write_str("invalid preamble"),
             DecodeError::InvalidModule => f.write_str("invalid module"),
+            DecodeError::InvalidMemCount => f.write_str("greater than 1 memory"),
+            DecodeError::InvalidStart => f.write_str("invalid start function"),
+            DecodeError::InvalidExpr(e) => fmt::Display::fmt(e, f),
             DecodeError::InvalidName(e) => fmt::Display::fmt(e, f),
             DecodeError::Read(e) => fmt::Display::fmt(e, f),
         }
@@ -1678,14 +2129,27 @@ where
             | DecodeError::InvalidValueTy
             | DecodeError::InvalidFuncTy
             | DecodeError::InvalidLimits
+            | DecodeError::InvalidMemoryTy
             | DecodeError::InvalidInstr
+            | DecodeError::InvalidConstInstr
             | DecodeError::InvalidMut
             | DecodeError::InvalidImportDesc
+            | DecodeError::InvalidExportDesc
             | DecodeError::InvalidElementSegment
             | DecodeError::InvalidData
+            | DecodeError::InvalidTypeIndex
+            | DecodeError::InvalidFuncIndex
+            | DecodeError::InvalidTableIndex
+            | DecodeError::InvalidMemIndex
+            | DecodeError::InvalidGlobalIndex
+            | DecodeError::InvalidElementIndex
+            | DecodeError::InvalidDataIndex
             | DecodeError::InvalidSection
             | DecodeError::InvalidPreamble
-            | DecodeError::InvalidModule => None,
+            | DecodeError::InvalidModule
+            | DecodeError::InvalidMemCount
+            | DecodeError::InvalidStart => None,
+            DecodeError::InvalidExpr(e) => Some(e),
             DecodeError::InvalidName(e) => Some(e),
             DecodeError::Read(e) => Some(e),
         }

@@ -82,6 +82,22 @@ pub struct FuncTy {
     pub rt2: ResultTy,
 }
 
+impl FuncTy {
+    /// Returns true if the parameter list is empty, false otherwise.
+    #[inline]
+    #[must_use]
+    pub fn is_params_empty(&self) -> bool {
+        self.rt1.0.is_empty()
+    }
+
+    /// Returns true if the return type list is empty, false otherwise.
+    #[inline]
+    #[must_use]
+    pub fn is_return_empty(&self) -> bool {
+        self.rt2.0.is_empty()
+    }
+}
+
 /// Minimum and optional maximum limits of `Memory` and `Table`s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {

@@ -7,7 +7,8 @@ use std::vec::Vec;
 
 use super::{
     ty::{NumTy, RefTy, ValTy},
-    DataIndex, ElementIndex, FuncIndex, GlobalIndex, LabelIndex, LocalIndex, TableIndex, TypeIndex,
+    DataIndex, ElementIndex, FuncIndex, GlobalIndex, ImportGlobalIndex, LabelIndex, LocalIndex,
+    TableIndex, TypeIndex,
 };
 
 /// Sign extension mode
@@ -333,11 +334,9 @@ pub enum Mem {
 /// Block type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockTy {
-    /// Empty
-    Empty,
-    /// Value
-    Val(ValTy),
-    /// Type Index
+    /// Single optional return type of block
+    Val(Option<ValTy>),
+    /// Parameter and return type like the function type
     Index(TypeIndex),
 }
 
@@ -394,8 +393,28 @@ pub enum Instr {
     Num(Num),
 }
 
+/// Constant Instruction
+#[allow(clippy::module_name_repetitions)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConstInstr {
+    /// Numeric constant
+    Constant(Const),
+    /// 0xd0
+    RefNull(RefTy),
+    /// 0xd2
+    RefFunc(FuncIndex),
+    /// 0x23
+    GlobalGet(ImportGlobalIndex),
+}
+
 /// Expressions terminated with an explicit 0x0b opcode for end.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Expr {
     pub instrs: Vec<Instr>,
+}
+
+/// Constant Expressions terminated with an explicit 0x0b opcode for end.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstExpr {
+    pub instrs: Vec<ConstInstr>,
 }

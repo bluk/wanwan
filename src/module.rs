@@ -6,7 +6,7 @@ use alloc::{string::String, vec::Vec};
 use std::{string::String, vec::Vec};
 
 use self::{
-    instr::Expr,
+    instr::{ConstExpr, Expr},
     ty::{FuncTy, GlobalTy, MemoryTy, RefTy, TableTy, ValTy},
 };
 
@@ -16,6 +16,10 @@ pub mod ty;
 /// Index for a [`FuncTy`] in the [`SectionId::Type`] section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypeIndex(pub u32);
+
+/// Index for a global variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportGlobalIndex(pub u32);
 
 /// Index for a function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +75,7 @@ pub struct Mem {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Global {
     pub ty: GlobalTy,
-    pub init: Expr,
+    pub init: ConstExpr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -79,7 +83,7 @@ pub enum ElementSegmentMode {
     /// Elements can be copied via [`Instr::TableInit`] instruction.
     Passive,
     /// Elements can be copied during instantiation.
-    Active(TableIndex, Expr),
+    Active(TableIndex, ConstExpr),
     /// Used with [`Instr::RefFunc`].
     Declarative,
 }
@@ -88,14 +92,14 @@ pub enum ElementSegmentMode {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Elem {
     pub ty: RefTy,
-    pub init: Vec<Expr>,
+    pub init: Vec<ConstExpr>,
     pub mode: ElementSegmentMode,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DataMode {
     Passive,
-    Active(MemIndex, Expr),
+    Active(MemIndex, ConstExpr),
 }
 
 #[derive(Debug, Clone, PartialEq)]
