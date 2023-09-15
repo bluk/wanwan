@@ -2770,7 +2770,12 @@ impl Module {
                         globals: &globals,
                     };
                     exports = decode_vec(reader, |r| Export::decode(r, &ctx))?;
-                    // TODO: Validate all export names are unique
+
+                    for e in &exports {
+                        if exports.iter().filter(|n| n.name == e.name).count() > 1 {
+                            return Err(DecodeError::InvalidSection);
+                        }
+                    }
                 }
                 SectionId::Start => {
                     let ctx = StartSectionValidator {
