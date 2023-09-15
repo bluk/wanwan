@@ -341,12 +341,11 @@ const OP_CODE_ELSE: u8 = 0x05;
 
 impl Instr {
     #[allow(clippy::too_many_lines)]
-    fn decode_with_op_code<R, C>(
-        op_code: u8,
+    fn decode<R, C>(
         reader: &mut R,
         ctx: &C,
         validator: &mut FuncExprValidator,
-    ) -> Result<Self, DecodeError<R::Error>>
+    ) -> Result<Vec<Self>, DecodeError<R::Error>>
     where
         R: Read,
         C: TypesContext
@@ -363,1593 +362,1622 @@ impl Instr {
             Variable,
         };
 
-        macro_rules! control_op {
-            ($bt:expr) => {
-                match $bt {
-                    BlockTy::Val(rt) => match rt {
-                        Some(rt) => {
-                            validator.push_ctrl(op_code, Vec::new(), vec![rt.into()]);
+        enum RecursiveTerm {
+            BlockEnd(BlockTy, usize),
+            LoopEnd(BlockTy, usize),
+            IfOnlyEnd(BlockTy, usize, usize),
+            EndElseIf(BlockTy, usize),
+        }
+
+        let mut instrs = Vec::new();
+        let mut terms = Vec::new();
+
+        loop {
+            let op_code = reader.next()?;
+
+            macro_rules! control_op {
+                ($bt:expr) => {
+                    match $bt {
+                        BlockTy::Val(rt) => match rt {
+                            Some(rt) => {
+                                validator.push_ctrl(op_code, Vec::new(), vec![rt.into()]);
+                            }
+                            None => {
+                                validator.push_ctrl(op_code, Vec::new(), vec![]);
+                            }
+                        },
+                        BlockTy::Index(idx) => {
+                            // XXX: Double valiation of type index
+                            let func_ty = ctx.func_ty(idx).unwrap();
+                            // XXX: Allocating here
+                            let params = func_ty
+                                .rt1
+                                .0
+                                .iter()
+                                .copied()
+                                .map(Into::into)
+                                .collect::<Vec<_>>();
+                            validator.pop_expect_vals(&params)?;
+                            validator.push_ctrl(
+                                op_code,
+                                params,
+                                // XXX: Allocating here
+                                func_ty.rt2.0.iter().copied().map(Into::into).collect(),
+                            );
                         }
-                        None => {
-                            validator.push_ctrl(op_code, Vec::new(), vec![]);
+                    }
+                };
+            }
+
+            macro_rules! mem_load {
+                ($t:expr, $align:expr, $bits_len:literal) => {
+                    if !ctx.is_mem_valid(MemIndex(0)) {
+                        // TODO: More specific errror
+                        return Err(DecodeError::InvalidInstr);
+                    }
+                    if 2u32.pow($align) > $bits_len / 8 {
+                        // TODO: More specific errror
+                        return Err(DecodeError::InvalidInstr);
+                    }
+
+                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                    validator.push_val(OpdTy::Num($t));
+                };
+            }
+
+            macro_rules! mem_store {
+                ($t:expr, $align:expr, $bits_len:literal) => {
+                    if !ctx.is_mem_valid(MemIndex(0)) {
+                        // TODO: More specific errror
+                        return Err(DecodeError::InvalidInstr);
+                    }
+                    if 2u32.pow($align) > $bits_len / 8 {
+                        // TODO: More specific errror
+                        return Err(DecodeError::InvalidInstr);
+                    }
+
+                    validator.pop_expect_val(OpdTy::Num($t))?;
+                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                };
+            }
+
+            macro_rules! num_const {
+                ($t:expr) => {
+                    validator.push_val(OpdTy::Num($t));
+                };
+            }
+
+            macro_rules! num_unop {
+                ($t:expr) => {
+                    validator.pop_expect_val(OpdTy::Num($t))?;
+                    validator.push_val(OpdTy::Num($t));
+                };
+            }
+
+            macro_rules! num_binop {
+                ($t:expr) => {
+                    validator.pop_expect_val(OpdTy::Num($t))?;
+                    validator.pop_expect_val(OpdTy::Num($t))?;
+                    validator.push_val(OpdTy::Num($t));
+                };
+            }
+
+            macro_rules! num_testop {
+                ($t:expr) => {
+                    validator.pop_expect_val(OpdTy::Num($t))?;
+                    validator.push_val(OpdTy::Num(NumTy::I32));
+                };
+            }
+
+            macro_rules! num_relop {
+                ($t:expr) => {
+                    validator.pop_expect_val(OpdTy::Num($t))?;
+                    validator.pop_expect_val(OpdTy::Num($t))?;
+                    validator.push_val(OpdTy::Num(NumTy::I32));
+                };
+            }
+
+            macro_rules! num_cvtop {
+                ($t1:expr, $t2:expr) => {
+                    validator.pop_expect_val(OpdTy::Num($t1))?;
+                    validator.push_val(OpdTy::Num($t2));
+                };
+            }
+
+            let instr = match op_code {
+                // Control Instructions
+                0x00 => {
+                    validator.unreachable()?;
+
+                    Self::Control(Control::Unreachable)
+                }
+                0x01 => Self::Control(Control::Nop),
+                0x02 => {
+                    let bt = BlockTy::decode(reader, ctx)?;
+                    control_op!(bt);
+                    terms.push(RecursiveTerm::BlockEnd(bt, instrs.len()));
+                    continue;
+                }
+                0x03 => {
+                    let bt = BlockTy::decode(reader, ctx)?;
+                    control_op!(bt);
+                    terms.push(RecursiveTerm::LoopEnd(bt, instrs.len()));
+                    continue;
+                }
+                0x04 => {
+                    let bt = BlockTy::decode(reader, ctx)?;
+                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                    control_op!(bt);
+                    terms.push(RecursiveTerm::EndElseIf(bt, instrs.len()));
+                    continue;
+                }
+                0x05 => {
+                    let frame = validator.pop_ctrl()?;
+                    if frame.op_code != 0x04 {
+                        return Err(DecodeError::InvalidInstr);
+                    }
+                    validator.push_ctrl(OP_CODE_ELSE, frame.start_tys, frame.end_tys);
+
+                    let Some(term) = terms.pop() else {
+                        return Err(DecodeError::InvalidInstr);
+                    };
+                    match term {
+                        RecursiveTerm::BlockEnd(_, _)
+                        | RecursiveTerm::LoopEnd(_, _)
+                        | RecursiveTerm::IfOnlyEnd(_, _, _) => {
+                            return Err(DecodeError::InvalidInstr)
                         }
-                    },
-                    BlockTy::Index(idx) => {
-                        // XXX: Double valiation of type index
-                        let func_ty = ctx.func_ty(idx).unwrap();
-                        // XXX: Allocating here
-                        let params = func_ty
+                        RecursiveTerm::EndElseIf(bt, len) => {
+                            terms.push(RecursiveTerm::IfOnlyEnd(bt, len, instrs.len()));
+                        }
+                    }
+                    continue;
+                }
+                0x0b => {
+                    let frame = validator.pop_ctrl()?;
+                    validator.push_vals(&frame.end_tys);
+
+                    let Some(term) = terms.pop() else {
+                        if terms.is_empty() {
+                            return Ok(instrs);
+                        }
+
+                        return Err(DecodeError::InvalidInstr);
+                    };
+                    match term {
+                        RecursiveTerm::BlockEnd(bt, len) => {
+                            let block_instrs = instrs.split_off(len);
+                            instrs.push(Self::Control(Control::Block {
+                                bt,
+                                instrs: block_instrs,
+                            }));
+                        }
+                        RecursiveTerm::LoopEnd(bt, len) => {
+                            let block_instrs = instrs.split_off(len);
+                            instrs.push(Self::Control(Control::Loop {
+                                bt,
+                                instrs: block_instrs,
+                            }));
+                        }
+                        RecursiveTerm::IfOnlyEnd(bt, then_len, el_len) => {
+                            let el = instrs.split_off(el_len);
+                            let then = instrs.split_off(then_len);
+                            instrs.push(Self::Control(Control::If { bt, then, el }));
+                        }
+                        RecursiveTerm::EndElseIf(bt, len) => {
+                            let then = instrs.split_off(len);
+                            instrs.push(Self::Control(Control::If {
+                                bt,
+                                then,
+                                el: Vec::new(),
+                            }));
+                        }
+                    }
+
+                    continue;
+                }
+                0x0c => {
+                    let l = LabelIndex::decode(reader)?;
+                    if validator.ctrl_frames_len() < usize::try_from(l.0).unwrap() {
+                        // TODO: Check if correct error
+                        return Err(DecodeError::InvalidExpr(ExprError::Underflow));
+                    }
+                    // XXX: Allocation here
+                    let label_tys = validator
+                        .label_tys(l)
+                        .iter()
+                        .copied()
+                        .map(Into::into)
+                        .collect::<Vec<OpdTy>>();
+                    validator.pop_expect_vals(&label_tys)?;
+                    validator.unreachable()?;
+
+                    Self::Control(Control::Br(l))
+                }
+                0x0d => {
+                    let l = LabelIndex::decode(reader)?;
+
+                    if validator.ctrl_frames_len() < usize::try_from(l.0).unwrap() {
+                        // TODO: Check if correct error
+                        return Err(DecodeError::InvalidExpr(ExprError::Underflow));
+                    }
+                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                    // XXX: Allocation here
+                    let label_tys = validator
+                        .label_tys(l)
+                        .iter()
+                        .copied()
+                        .map(Into::into)
+                        .collect::<Vec<OpdTy>>();
+                    validator.pop_expect_vals(&label_tys)?;
+                    validator.push_vals(&label_tys);
+
+                    Self::Control(Control::BrIf(l))
+                }
+                0x0e => {
+                    let table = decode_vec(reader, LabelIndex::decode)?;
+                    let idx = LabelIndex::decode(reader)?;
+
+                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                    if validator.ctrl_frames_len() <= usize::try_from(idx.0).unwrap() {
+                        // TODO: Check if correct error
+                        return Err(DecodeError::InvalidExpr(ExprError::Underflow));
+                    }
+                    let arity = validator.label_tys(idx).len();
+                    for n in &table {
+                        if validator.ctrl_frames_len() <= usize::try_from(n.0).unwrap() {
+                            // TODO: Check if correct error
+                            return Err(DecodeError::InvalidExpr(ExprError::Underflow));
+                        }
+
+                        let opd_tys = validator.label_tys(*n);
+
+                        if opd_tys.len() != arity {
+                            // TODO: Check if correct error
+                            return Err(DecodeError::InvalidExpr(ExprError::Underflow));
+                        }
+
+                        let opd_tys = opd_tys.to_vec();
+                        let popped_tys = validator.pop_expect_vals(&opd_tys)?;
+                        validator.push_vals(&popped_tys);
+                    }
+                    let opd_tys = validator.label_tys(idx).to_vec();
+                    validator.pop_expect_vals(&opd_tys)?;
+                    validator.unreachable()?;
+
+                    Self::Control(Control::BrTable { table, idx })
+                }
+                0x0f => {
+                    validator.ret()?;
+                    Self::Control(Control::Return)
+                }
+                0x10 => {
+                    let idx = FuncIndex::decode(reader, ctx)?;
+                    let Some(ty_idx) = ctx.type_index(idx) else {
+                        return Err(DecodeError::InvalidFuncIndex);
+                    };
+                    let Some(func_ty) = ctx.func_ty(ty_idx) else {
+                        return Err(DecodeError::InvalidTypeIndex);
+                    };
+                    validator.pop_expect_vals(
+                        &func_ty
                             .rt1
                             .0
                             .iter()
                             .copied()
-                            .map(Into::into)
-                            .collect::<Vec<_>>();
-                        validator.pop_expect_vals(&params)?;
-                        validator.push_ctrl(
-                            op_code,
-                            params,
-                            // XXX: Allocating here
-                            func_ty.rt2.0.iter().copied().map(Into::into).collect(),
-                        );
+                            .map(OpdTy::from)
+                            .collect::<Vec<_>>(),
+                    )?;
+                    validator.push_vals(
+                        &func_ty
+                            .rt2
+                            .0
+                            .iter()
+                            .copied()
+                            .map(OpdTy::from)
+                            .collect::<Vec<_>>(),
+                    );
+
+                    Self::Control(Control::Call(idx))
+                }
+                0x11 => {
+                    let y = TypeIndex::decode(reader, ctx)?;
+                    let x = TableIndex::decode(reader, ctx)?;
+
+                    let Some(table_ty) = ctx.table_ty(x) else {
+                        return Err(DecodeError::InvalidTableIndex);
+                    };
+                    if table_ty.elem_ty != RefTy::FuncRef {
+                        return Err(DecodeError::InvalidInstr);
                     }
-                }
-            };
-        }
+                    let Some(func_ty) = ctx.func_ty(y) else {
+                        return Err(DecodeError::InvalidFuncIndex);
+                    };
+                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
 
-        macro_rules! mem_load {
-            ($t:expr, $align:expr, $bits_len:literal) => {
-                if !ctx.is_mem_valid(MemIndex(0)) {
-                    // TODO: More specific errror
-                    return Err(DecodeError::InvalidInstr);
-                }
-                if 2u32.pow($align) > $bits_len / 8 {
-                    // TODO: More specific errror
-                    return Err(DecodeError::InvalidInstr);
-                }
-
-                validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                validator.push_val(OpdTy::Num($t));
-            };
-        }
-
-        macro_rules! mem_store {
-            ($t:expr, $align:expr, $bits_len:literal) => {
-                if !ctx.is_mem_valid(MemIndex(0)) {
-                    // TODO: More specific errror
-                    return Err(DecodeError::InvalidInstr);
-                }
-                if 2u32.pow($align) > $bits_len / 8 {
-                    // TODO: More specific errror
-                    return Err(DecodeError::InvalidInstr);
-                }
-
-                validator.pop_expect_val(OpdTy::Num($t))?;
-                validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-            };
-        }
-
-        macro_rules! num_const {
-            ($t:expr) => {
-                validator.push_val(OpdTy::Num($t));
-            };
-        }
-
-        macro_rules! num_unop {
-            ($t:expr) => {
-                validator.pop_expect_val(OpdTy::Num($t))?;
-                validator.push_val(OpdTy::Num($t));
-            };
-        }
-
-        macro_rules! num_binop {
-            ($t:expr) => {
-                validator.pop_expect_val(OpdTy::Num($t))?;
-                validator.pop_expect_val(OpdTy::Num($t))?;
-                validator.push_val(OpdTy::Num($t));
-            };
-        }
-
-        macro_rules! num_testop {
-            ($t:expr) => {
-                validator.pop_expect_val(OpdTy::Num($t))?;
-                validator.push_val(OpdTy::Num(NumTy::I32));
-            };
-        }
-
-        macro_rules! num_relop {
-            ($t:expr) => {
-                validator.pop_expect_val(OpdTy::Num($t))?;
-                validator.pop_expect_val(OpdTy::Num($t))?;
-                validator.push_val(OpdTy::Num(NumTy::I32));
-            };
-        }
-
-        macro_rules! num_cvtop {
-            ($t1:expr, $t2:expr) => {
-                validator.pop_expect_val(OpdTy::Num($t1))?;
-                validator.push_val(OpdTy::Num($t2));
-            };
-        }
-
-        Ok(match op_code {
-            // Control Instructions
-            0x00 => {
-                validator.unreachable()?;
-
-                Self::Control(Control::Unreachable)
-            }
-            0x01 => Self::Control(Control::Nop),
-            0x02 => {
-                let bt = BlockTy::decode(reader, ctx)?;
-                control_op!(bt);
-                let (instrs, _) = Self::decode_until(reader, &[OP_CODE_END], ctx, validator)?;
-                Self::Control(Control::Block { bt, instrs })
-            }
-            0x03 => {
-                let bt = BlockTy::decode(reader, ctx)?;
-                control_op!(bt);
-                let (instrs, _) = Self::decode_until(reader, &[OP_CODE_END], ctx, validator)?;
-                Self::Control(Control::Loop { bt, instrs })
-            }
-            0x04 => {
-                let bt = BlockTy::decode(reader, ctx)?;
-                validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                control_op!(bt);
-                let (then, end) =
-                    Self::decode_until(reader, &[OP_CODE_ELSE, OP_CODE_END], ctx, validator)?;
-                let el = if end == OP_CODE_END {
-                    Vec::new()
-                } else {
-                    let (instrs, _) = Self::decode_until(reader, &[OP_CODE_END], ctx, validator)?;
-                    instrs
-                };
-                Self::Control(Control::If { bt, then, el })
-            }
-            0x0c => {
-                let l = LabelIndex::decode(reader)?;
-                if validator.ctrl_frames_len() < usize::try_from(l.0).unwrap() {
-                    // TODO: Check if correct error
-                    return Err(DecodeError::InvalidExpr(ExprError::Underflow));
-                }
-                // XXX: Allocation here
-                let label_tys = validator
-                    .label_tys(l)
-                    .iter()
-                    .copied()
-                    .map(Into::into)
-                    .collect::<Vec<OpdTy>>();
-                validator.pop_expect_vals(&label_tys)?;
-                validator.unreachable()?;
-
-                Self::Control(Control::Br(l))
-            }
-            0x0d => {
-                let l = LabelIndex::decode(reader)?;
-
-                if validator.ctrl_frames_len() < usize::try_from(l.0).unwrap() {
-                    // TODO: Check if correct error
-                    return Err(DecodeError::InvalidExpr(ExprError::Underflow));
-                }
-                validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                // XXX: Allocation here
-                let label_tys = validator
-                    .label_tys(l)
-                    .iter()
-                    .copied()
-                    .map(Into::into)
-                    .collect::<Vec<OpdTy>>();
-                validator.pop_expect_vals(&label_tys)?;
-                validator.push_vals(&label_tys);
-
-                Self::Control(Control::BrIf(l))
-            }
-            0x0e => {
-                let table = decode_vec(reader, LabelIndex::decode)?;
-                let idx = LabelIndex::decode(reader)?;
-
-                validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                if validator.ctrl_frames_len() <= usize::try_from(idx.0).unwrap() {
-                    // TODO: Check if correct error
-                    return Err(DecodeError::InvalidExpr(ExprError::Underflow));
-                }
-                let arity = validator.label_tys(idx).len();
-                for n in &table {
-                    if validator.ctrl_frames_len() <= usize::try_from(n.0).unwrap() {
-                        // TODO: Check if correct error
-                        return Err(DecodeError::InvalidExpr(ExprError::Underflow));
-                    }
-
-                    let opd_tys = validator.label_tys(*n);
-
-                    if opd_tys.len() != arity {
-                        // TODO: Check if correct error
-                        return Err(DecodeError::InvalidExpr(ExprError::Underflow));
-                    }
-
-                    let opd_tys = opd_tys.to_vec();
-                    let popped_tys = validator.pop_expect_vals(&opd_tys)?;
-                    validator.push_vals(&popped_tys);
-                }
-                let opd_tys = validator.label_tys(idx).to_vec();
-                validator.pop_expect_vals(&opd_tys)?;
-                validator.unreachable()?;
-
-                Self::Control(Control::BrTable { table, idx })
-            }
-            0x0f => {
-                validator.ret()?;
-                Self::Control(Control::Return)
-            }
-            0x10 => {
-                let idx = FuncIndex::decode(reader, ctx)?;
-                let Some(ty_idx) = ctx.type_index(idx) else {
-                    return Err(DecodeError::InvalidFuncIndex);
-                };
-                let Some(func_ty) = ctx.func_ty(ty_idx) else {
-                    return Err(DecodeError::InvalidTypeIndex);
-                };
-                validator.pop_expect_vals(
-                    &func_ty
+                    let params = func_ty
                         .rt1
                         .0
                         .iter()
                         .copied()
                         .map(OpdTy::from)
-                        .collect::<Vec<_>>(),
-                )?;
-                validator.push_vals(
-                    &func_ty
+                        .collect::<Vec<_>>();
+                    validator.pop_expect_vals(&params)?;
+
+                    let ret = func_ty
                         .rt2
                         .0
                         .iter()
                         .copied()
                         .map(OpdTy::from)
-                        .collect::<Vec<_>>(),
-                );
+                        .collect::<Vec<_>>();
+                    validator.push_vals(&ret);
 
-                Self::Control(Control::Call(idx))
-            }
-            0x11 => {
-                let y = TypeIndex::decode(reader, ctx)?;
-                let x = TableIndex::decode(reader, ctx)?;
-
-                let Some(table_ty) = ctx.table_ty(x) else {
-                    return Err(DecodeError::InvalidTableIndex);
-                };
-                if table_ty.elem_ty != RefTy::FuncRef {
-                    return Err(DecodeError::InvalidInstr);
-                }
-                let Some(func_ty) = ctx.func_ty(y) else {
-                    return Err(DecodeError::InvalidFuncIndex);
-                };
-                validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-
-                let params = func_ty
-                    .rt1
-                    .0
-                    .iter()
-                    .copied()
-                    .map(OpdTy::from)
-                    .collect::<Vec<_>>();
-                validator.pop_expect_vals(&params)?;
-
-                let ret = func_ty
-                    .rt2
-                    .0
-                    .iter()
-                    .copied()
-                    .map(OpdTy::from)
-                    .collect::<Vec<_>>();
-                validator.push_vals(&ret);
-
-                Self::Control(Control::CallIndirect { y, x })
-            }
-
-            // Reference Instructions
-            0xd0 => {
-                let t = RefTy::decode(reader)?;
-                validator.push_val(OpdTy::Ref(t));
-                Self::Ref(Ref::RefNull(t))
-            }
-            0xd1 => {
-                let t = validator.pop_val()?;
-                if !t.is_ref() {
-                    return Err(DecodeError::InvalidExpr(ExprError::UnexpectedTy));
-                }
-                validator.push_val(OpdTy::Num(NumTy::I32));
-                Self::Ref(Ref::RefIsNull)
-            }
-            0xd2 => {
-                let x = FuncIndex::decode(reader, ctx)?;
-                validator.push_val(OpdTy::Ref(RefTy::FuncRef));
-                Self::Ref(Ref::RefFunc(x))
-            }
-
-            // Parametric Instructions
-            0x1a => {
-                validator.pop_val()?;
-                Self::Parametric(Parametric::Drop)
-            }
-            0x1b => {
-                validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-
-                let t1 = validator.pop_val()?;
-                if !t1.is_num() && !t1.is_vec() {
-                    return Err(DecodeError::InvalidExpr(ExprError::UnexpectedTy));
-                }
-                let t2 = validator.pop_val()?;
-                if t1 != t2 && t1 != OpdTy::Unknown && t2 != OpdTy::Unknown {
-                    return Err(DecodeError::InvalidExpr(ExprError::UnexpectedTy));
+                    Self::Control(Control::CallIndirect { y, x })
                 }
 
-                validator.push_val(t1);
-
-                Self::Parametric(Parametric::Select(None))
-            }
-            0x1c => {
-                let t = decode_vec(reader, ValTy::decode)?;
-                if t.len() != 1 {
-                    return Err(DecodeError::InvalidExpr(ExprError::UnexpectedTy));
+                // Reference Instructions
+                0xd0 => {
+                    let t = RefTy::decode(reader)?;
+                    validator.push_val(OpdTy::Ref(t));
+                    Self::Ref(Ref::RefNull(t))
                 }
-                let expected = t.iter().copied().map(Into::into).collect::<Vec<OpdTy>>();
-                validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                validator.pop_expect_vals(&expected)?;
-                validator.pop_expect_vals(&expected)?;
-                validator.push_vals(&expected);
-
-                Self::Parametric(Parametric::Select(Some(t)))
-            }
-
-            // Variable Instructions
-            0x20 => {
-                let x = LocalIndex::decode(reader)?;
-                let Some(ty) = validator.local_idx(x) else {
-                    // TODO: Wrong error
-                    return Err(DecodeError::InvalidInstr);
-                };
-                validator.push_val(ty);
-                Self::Var(Variable::LocalGet(x))
-            }
-            0x21 => {
-                let x = LocalIndex::decode(reader)?;
-                let Some(ty) = validator.local_idx(x) else {
-                    // TODO: Wrong error
-                    return Err(DecodeError::InvalidInstr);
-                };
-                validator.pop_expect_val(ty)?;
-                Self::Var(Variable::LocalSet(x))
-            }
-            0x22 => {
-                let x = LocalIndex::decode(reader)?;
-                let Some(ty) = validator.local_idx(x) else {
-                    // TODO: Wrong error
-                    return Err(DecodeError::InvalidInstr);
-                };
-                validator.pop_expect_val(ty)?;
-                validator.push_val(ty);
-                Self::Var(Variable::LocalTee(x))
-            }
-            0x23 => {
-                let x = GlobalIndex::decode(reader, ctx)?;
-                // XXX Did another verifiation of GlobalIndex
-                let Some(ty) = ctx.global_ty(x) else {
-                    return Err(DecodeError::InvalidGlobalIndex);
-                };
-                validator.push_val(ty.t.into());
-
-                Self::Var(Variable::GlobalGet(x))
-            }
-            0x24 => {
-                let x = GlobalIndex::decode(reader, ctx)?;
-                // XXX Did another verifiation of GlobalIndex
-                let Some(ty) = ctx.global_ty(x) else {
-                    return Err(DecodeError::InvalidGlobalIndex);
-                };
-
-                match ty.m {
-                    Mut::Const => return Err(DecodeError::InvalidInstr),
-                    Mut::Var => {}
+                0xd1 => {
+                    let t = validator.pop_val()?;
+                    if !t.is_ref() {
+                        return Err(DecodeError::InvalidExpr(ExprError::UnexpectedTy));
+                    }
+                    validator.push_val(OpdTy::Num(NumTy::I32));
+                    Self::Ref(Ref::RefIsNull)
                 }
-                validator.pop_expect_val(ty.t.into())?;
-
-                Self::Var(Variable::GlobalSet(x))
-            }
-
-            // Table Instructions
-            0x25 => {
-                let x = TableIndex::decode(reader, ctx)?;
-
-                validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                let Some(ty) = ctx.table_ty(x) else {
-                    return Err(DecodeError::InvalidTableIndex);
-                };
-                validator.push_val(OpdTy::Ref(ty.elem_ty));
-
-                Self::Table(Table::TableGet(x))
-            }
-            0x26 => {
-                let x = TableIndex::decode(reader, ctx)?;
-
-                let Some(ty) = ctx.table_ty(x) else {
-                    return Err(DecodeError::InvalidTableIndex);
-                };
-                validator.pop_expect_val(OpdTy::Ref(ty.elem_ty))?;
-                validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-
-                Self::Table(Table::TableSet(x))
-            }
-
-            // Memory Instructions
-            0x28 => {
-                let m = MemArg::decode(reader)?;
-                mem_load!(NumTy::I32, m.align, 32u32);
-                Self::Mem(Mem::Load(NumTy::I32, m, None))
-            }
-            0x29 => {
-                let m = MemArg::decode(reader)?;
-                mem_load!(NumTy::I64, m.align, 64u32);
-                Self::Mem(Mem::Load(NumTy::I64, m, None))
-            }
-            0x2a => {
-                let m = MemArg::decode(reader)?;
-                mem_load!(NumTy::F32, m.align, 32u32);
-                Self::Mem(Mem::Load(NumTy::F32, m, None))
-            }
-            0x2b => {
-                let m = MemArg::decode(reader)?;
-                mem_load!(NumTy::F64, m.align, 64u32);
-                Self::Mem(Mem::Load(NumTy::F64, m, None))
-            }
-            0x2c => {
-                let m = MemArg::decode(reader)?;
-                mem_load!(NumTy::I32, m.align, 8u32);
-                Self::Mem(Mem::Load(
-                    NumTy::I32,
-                    m,
-                    Some((StorageSize::Size8, SignExtension::Signed)),
-                ))
-            }
-            0x2d => {
-                let m = MemArg::decode(reader)?;
-                mem_load!(NumTy::I32, m.align, 8u32);
-                Self::Mem(Mem::Load(
-                    NumTy::I32,
-                    m,
-                    Some((StorageSize::Size8, SignExtension::Unsigned)),
-                ))
-            }
-            0x2e => {
-                let m = MemArg::decode(reader)?;
-                mem_load!(NumTy::I32, m.align, 16u32);
-                Self::Mem(Mem::Load(
-                    NumTy::I32,
-                    m,
-                    Some((StorageSize::Size16, SignExtension::Signed)),
-                ))
-            }
-            0x2f => {
-                let m = MemArg::decode(reader)?;
-                mem_load!(NumTy::I32, m.align, 16u32);
-                Self::Mem(Mem::Load(
-                    NumTy::I32,
-                    m,
-                    Some((StorageSize::Size16, SignExtension::Unsigned)),
-                ))
-            }
-            0x30 => {
-                let m = MemArg::decode(reader)?;
-                mem_load!(NumTy::I64, m.align, 8u32);
-                Self::Mem(Mem::Load(
-                    NumTy::I64,
-                    m,
-                    Some((StorageSize::Size8, SignExtension::Signed)),
-                ))
-            }
-            0x31 => {
-                let m = MemArg::decode(reader)?;
-                mem_load!(NumTy::I64, m.align, 8u32);
-                Self::Mem(Mem::Load(
-                    NumTy::I64,
-                    m,
-                    Some((StorageSize::Size8, SignExtension::Unsigned)),
-                ))
-            }
-            0x32 => {
-                let m = MemArg::decode(reader)?;
-                mem_load!(NumTy::I64, m.align, 16u32);
-                Self::Mem(Mem::Load(
-                    NumTy::I64,
-                    m,
-                    Some((StorageSize::Size16, SignExtension::Signed)),
-                ))
-            }
-            0x33 => {
-                let m = MemArg::decode(reader)?;
-                mem_load!(NumTy::I64, m.align, 16u32);
-                Self::Mem(Mem::Load(
-                    NumTy::I64,
-                    m,
-                    Some((StorageSize::Size16, SignExtension::Unsigned)),
-                ))
-            }
-            0x34 => {
-                let m = MemArg::decode(reader)?;
-                mem_load!(NumTy::I64, m.align, 32u32);
-                Self::Mem(Mem::Load(
-                    NumTy::I64,
-                    m,
-                    Some((StorageSize::Size32, SignExtension::Signed)),
-                ))
-            }
-            0x35 => {
-                let m = MemArg::decode(reader)?;
-                mem_load!(NumTy::I64, m.align, 32u32);
-                Self::Mem(Mem::Load(
-                    NumTy::I64,
-                    m,
-                    Some((StorageSize::Size32, SignExtension::Unsigned)),
-                ))
-            }
-            0x36 => {
-                let m = MemArg::decode(reader)?;
-                mem_store!(NumTy::I32, m.align, 32u32);
-                Self::Mem(Mem::Store(NumTy::I32, m, None))
-            }
-            0x37 => {
-                let m = MemArg::decode(reader)?;
-                mem_store!(NumTy::I64, m.align, 64u32);
-                Self::Mem(Mem::Store(NumTy::I64, m, None))
-            }
-            0x38 => {
-                let m = MemArg::decode(reader)?;
-                mem_store!(NumTy::F32, m.align, 32u32);
-                Self::Mem(Mem::Store(NumTy::F32, m, None))
-            }
-            0x39 => {
-                let m = MemArg::decode(reader)?;
-                mem_store!(NumTy::F64, m.align, 64u32);
-                Self::Mem(Mem::Store(NumTy::F64, m, None))
-            }
-            0x3A => {
-                let m = MemArg::decode(reader)?;
-                mem_store!(NumTy::I32, m.align, 8u32);
-                Self::Mem(Mem::Store(NumTy::I32, m, Some(StorageSize::Size8)))
-            }
-            0x3B => {
-                let m = MemArg::decode(reader)?;
-                mem_store!(NumTy::I32, m.align, 16u32);
-                Self::Mem(Mem::Store(NumTy::I32, m, Some(StorageSize::Size16)))
-            }
-            0x3C => {
-                let m = MemArg::decode(reader)?;
-                mem_store!(NumTy::I64, m.align, 8u32);
-                Self::Mem(Mem::Store(NumTy::I64, m, Some(StorageSize::Size8)))
-            }
-            0x3D => {
-                let m = MemArg::decode(reader)?;
-                mem_store!(NumTy::I64, m.align, 16u32);
-                Self::Mem(Mem::Store(NumTy::I64, m, Some(StorageSize::Size16)))
-            }
-            0x3E => {
-                let m = MemArg::decode(reader)?;
-                mem_store!(NumTy::I64, m.align, 32u32);
-                Self::Mem(Mem::Store(NumTy::I64, m, Some(StorageSize::Size32)))
-            }
-            0x3F => {
-                match reader.next()? {
-                    0x00 => {}
-                    _ => return Err(DecodeError::InvalidInstr),
+                0xd2 => {
+                    let x = FuncIndex::decode(reader, ctx)?;
+                    validator.push_val(OpdTy::Ref(RefTy::FuncRef));
+                    Self::Ref(Ref::RefFunc(x))
                 }
 
-                if !ctx.is_mem_valid(MemIndex(0)) {
-                    // TODO: Need more specific error
-                    return Err(DecodeError::InvalidInstr);
+                // Parametric Instructions
+                0x1a => {
+                    validator.pop_val()?;
+                    Self::Parametric(Parametric::Drop)
                 }
+                0x1b => {
+                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
 
-                validator.push_val(OpdTy::Num(NumTy::I32));
-
-                Self::Mem(Mem::MemorySize)
-            }
-            0x40 => {
-                match reader.next()? {
-                    0x00 => {}
-                    _ => return Err(DecodeError::InvalidInstr),
-                }
-
-                if !ctx.is_mem_valid(MemIndex(0)) {
-                    // TODO: Need more specific error
-                    return Err(DecodeError::InvalidInstr);
-                }
-                validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                validator.push_val(OpdTy::Num(NumTy::I32));
-
-                Self::Mem(Mem::MemoryGrow)
-            }
-
-            // Numeric Instructions
-            0x41 => {
-                let n = decode_s32(reader)?;
-                num_const!(NumTy::I32);
-                Self::Num(Num::Constant(Const::I32(n)))
-            }
-            0x42 => {
-                let n = decode_s64(reader)?;
-                num_const!(NumTy::I64);
-                Self::Num(Num::Constant(Const::I64(n)))
-            }
-            0x43 => {
-                let n = decode_f32(reader)?;
-                num_const!(NumTy::F32);
-                Self::Num(Num::Constant(Const::F32(n)))
-            }
-            0x44 => {
-                let n = decode_f64(reader)?;
-                num_const!(NumTy::F64);
-                Self::Num(Num::Constant(Const::F64(n)))
-            }
-            // I32 Test Operations
-            0x45 => {
-                num_testop!(NumTy::I32);
-                Self::Num(Num::Int(IntTy::I32, NumIOp::Test(ITestOp::Eqz)))
-            }
-
-            // I32 Comparision operations
-            0x46 => {
-                num_relop!(NumTy::I32);
-                Self::Num(Num::Int(IntTy::I32, NumIOp::Rel(IRelOp::Eq)))
-            }
-            0x47 => {
-                num_relop!(NumTy::I32);
-                Self::Num(Num::Int(IntTy::I32, NumIOp::Rel(IRelOp::Ne)))
-            }
-            0x48 => {
-                num_relop!(NumTy::I32);
-                Self::Num(Num::Int(
-                    IntTy::I32,
-                    NumIOp::Rel(IRelOp::Lt(SignExtension::Signed)),
-                ))
-            }
-            0x49 => {
-                num_relop!(NumTy::I32);
-                Self::Num(Num::Int(
-                    IntTy::I32,
-                    NumIOp::Rel(IRelOp::Lt(SignExtension::Unsigned)),
-                ))
-            }
-            0x4a => {
-                num_relop!(NumTy::I32);
-                Self::Num(Num::Int(
-                    IntTy::I32,
-                    NumIOp::Rel(IRelOp::Gt(SignExtension::Signed)),
-                ))
-            }
-            0x4b => {
-                num_relop!(NumTy::I32);
-                Self::Num(Num::Int(
-                    IntTy::I32,
-                    NumIOp::Rel(IRelOp::Gt(SignExtension::Unsigned)),
-                ))
-            }
-            0x4c => {
-                num_relop!(NumTy::I32);
-                Self::Num(Num::Int(
-                    IntTy::I32,
-                    NumIOp::Rel(IRelOp::Le(SignExtension::Signed)),
-                ))
-            }
-            0x4d => {
-                num_relop!(NumTy::I32);
-                Self::Num(Num::Int(
-                    IntTy::I32,
-                    NumIOp::Rel(IRelOp::Le(SignExtension::Unsigned)),
-                ))
-            }
-            0x4e => {
-                num_relop!(NumTy::I32);
-                Self::Num(Num::Int(
-                    IntTy::I32,
-                    NumIOp::Rel(IRelOp::Ge(SignExtension::Signed)),
-                ))
-            }
-            0x4f => {
-                num_relop!(NumTy::I32);
-                Self::Num(Num::Int(
-                    IntTy::I32,
-                    NumIOp::Rel(IRelOp::Ge(SignExtension::Unsigned)),
-                ))
-            }
-
-            // I64 Test Operations
-            0x50 => {
-                num_testop!(NumTy::I64);
-                Self::Num(Num::Int(IntTy::I64, NumIOp::Test(ITestOp::Eqz)))
-            }
-
-            // I64 Comparision operations
-            0x51 => {
-                num_relop!(NumTy::I64);
-                Self::Num(Num::Int(IntTy::I64, NumIOp::Rel(IRelOp::Eq)))
-            }
-            0x52 => {
-                num_relop!(NumTy::I64);
-                Self::Num(Num::Int(IntTy::I64, NumIOp::Rel(IRelOp::Ne)))
-            }
-            0x53 => {
-                num_relop!(NumTy::I64);
-                Self::Num(Num::Int(
-                    IntTy::I64,
-                    NumIOp::Rel(IRelOp::Lt(SignExtension::Signed)),
-                ))
-            }
-            0x54 => {
-                num_relop!(NumTy::I64);
-                Self::Num(Num::Int(
-                    IntTy::I64,
-                    NumIOp::Rel(IRelOp::Lt(SignExtension::Unsigned)),
-                ))
-            }
-            0x55 => {
-                num_relop!(NumTy::I64);
-                Self::Num(Num::Int(
-                    IntTy::I64,
-                    NumIOp::Rel(IRelOp::Gt(SignExtension::Signed)),
-                ))
-            }
-            0x56 => {
-                num_relop!(NumTy::I64);
-                Self::Num(Num::Int(
-                    IntTy::I64,
-                    NumIOp::Rel(IRelOp::Gt(SignExtension::Unsigned)),
-                ))
-            }
-            0x57 => {
-                num_relop!(NumTy::I64);
-                Self::Num(Num::Int(
-                    IntTy::I64,
-                    NumIOp::Rel(IRelOp::Le(SignExtension::Signed)),
-                ))
-            }
-            0x58 => {
-                num_relop!(NumTy::I64);
-                Self::Num(Num::Int(
-                    IntTy::I64,
-                    NumIOp::Rel(IRelOp::Le(SignExtension::Unsigned)),
-                ))
-            }
-            0x59 => {
-                num_relop!(NumTy::I64);
-                Self::Num(Num::Int(
-                    IntTy::I64,
-                    NumIOp::Rel(IRelOp::Ge(SignExtension::Signed)),
-                ))
-            }
-            0x5a => {
-                num_relop!(NumTy::I64);
-                Self::Num(Num::Int(
-                    IntTy::I64,
-                    NumIOp::Rel(IRelOp::Ge(SignExtension::Unsigned)),
-                ))
-            }
-
-            // F32 Comparision operations
-            0x5b => {
-                num_relop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Eq)))
-            }
-            0x5c => {
-                num_relop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Ne)))
-            }
-            0x5d => {
-                num_relop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Lt)))
-            }
-            0x5e => {
-                num_relop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Gt)))
-            }
-            0x5f => {
-                num_relop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Le)))
-            }
-            0x60 => {
-                num_relop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Ge)))
-            }
-
-            // F64 Comparision operations
-            0x61 => {
-                num_relop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Eq)))
-            }
-            0x62 => {
-                num_relop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Ne)))
-            }
-            0x63 => {
-                num_relop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Lt)))
-            }
-            0x64 => {
-                num_relop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Gt)))
-            }
-            0x65 => {
-                num_relop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Le)))
-            }
-            0x66 => {
-                num_relop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Ge)))
-            }
-
-            // I32 remaining operations
-            0x67 => {
-                num_unop!(NumTy::I32);
-                Self::Num(Num::Int(IntTy::I32, NumIOp::Unary(IUnOp::Clz)))
-            }
-            0x68 => {
-                num_unop!(NumTy::I32);
-                Self::Num(Num::Int(IntTy::I32, NumIOp::Unary(IUnOp::Ctz)))
-            }
-            0x69 => {
-                num_unop!(NumTy::I32);
-                Self::Num(Num::Int(IntTy::I32, NumIOp::Unary(IUnOp::PopCnt)))
-            }
-            0x6a => {
-                num_binop!(NumTy::I32);
-                Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Add)))
-            }
-            0x6b => {
-                num_binop!(NumTy::I32);
-                Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Sub)))
-            }
-            0x6c => {
-                num_binop!(NumTy::I32);
-                Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Mul)))
-            }
-            0x6d => {
-                num_binop!(NumTy::I32);
-                Self::Num(Num::Int(
-                    IntTy::I32,
-                    NumIOp::Binary(IBinOp::Div(SignExtension::Signed)),
-                ))
-            }
-            0x6e => {
-                num_binop!(NumTy::I32);
-                Self::Num(Num::Int(
-                    IntTy::I32,
-                    NumIOp::Binary(IBinOp::Div(SignExtension::Unsigned)),
-                ))
-            }
-            0x6f => {
-                num_binop!(NumTy::I32);
-                Self::Num(Num::Int(
-                    IntTy::I32,
-                    NumIOp::Binary(IBinOp::Rem(SignExtension::Signed)),
-                ))
-            }
-            0x70 => {
-                num_binop!(NumTy::I32);
-                Self::Num(Num::Int(
-                    IntTy::I32,
-                    NumIOp::Binary(IBinOp::Rem(SignExtension::Unsigned)),
-                ))
-            }
-            0x71 => {
-                num_binop!(NumTy::I32);
-                Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::And)))
-            }
-            0x72 => {
-                num_binop!(NumTy::I32);
-                Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Or)))
-            }
-            0x73 => {
-                num_binop!(NumTy::I32);
-                Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Xor)))
-            }
-            0x74 => {
-                num_binop!(NumTy::I32);
-                Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Shl)))
-            }
-            0x75 => {
-                num_binop!(NumTy::I32);
-                Self::Num(Num::Int(
-                    IntTy::I32,
-                    NumIOp::Binary(IBinOp::Shr(SignExtension::Signed)),
-                ))
-            }
-            0x76 => {
-                num_binop!(NumTy::I32);
-                Self::Num(Num::Int(
-                    IntTy::I32,
-                    NumIOp::Binary(IBinOp::Shr(SignExtension::Unsigned)),
-                ))
-            }
-            0x77 => {
-                num_binop!(NumTy::I32);
-                Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Rotl)))
-            }
-            0x78 => {
-                num_binop!(NumTy::I32);
-                Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Rotr)))
-            }
-
-            // I64 remaining operations
-            0x79 => {
-                num_unop!(NumTy::I64);
-                Self::Num(Num::Int(IntTy::I64, NumIOp::Unary(IUnOp::Clz)))
-            }
-            0x7a => {
-                num_unop!(NumTy::I64);
-                Self::Num(Num::Int(IntTy::I64, NumIOp::Unary(IUnOp::Ctz)))
-            }
-            0x7b => {
-                num_unop!(NumTy::I64);
-                Self::Num(Num::Int(IntTy::I64, NumIOp::Unary(IUnOp::PopCnt)))
-            }
-            0x7c => {
-                num_binop!(NumTy::I64);
-                Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Add)))
-            }
-            0x7d => {
-                num_binop!(NumTy::I64);
-                Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Sub)))
-            }
-            0x7e => {
-                num_binop!(NumTy::I64);
-                Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Mul)))
-            }
-            0x7f => {
-                num_binop!(NumTy::I64);
-                Self::Num(Num::Int(
-                    IntTy::I64,
-                    NumIOp::Binary(IBinOp::Div(SignExtension::Signed)),
-                ))
-            }
-            0x80 => {
-                num_binop!(NumTy::I64);
-                Self::Num(Num::Int(
-                    IntTy::I64,
-                    NumIOp::Binary(IBinOp::Div(SignExtension::Unsigned)),
-                ))
-            }
-            0x81 => {
-                num_binop!(NumTy::I64);
-                Self::Num(Num::Int(
-                    IntTy::I64,
-                    NumIOp::Binary(IBinOp::Rem(SignExtension::Signed)),
-                ))
-            }
-            0x82 => {
-                num_binop!(NumTy::I64);
-                Self::Num(Num::Int(
-                    IntTy::I64,
-                    NumIOp::Binary(IBinOp::Rem(SignExtension::Unsigned)),
-                ))
-            }
-            0x83 => {
-                num_binop!(NumTy::I64);
-                Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::And)))
-            }
-            0x84 => {
-                num_binop!(NumTy::I64);
-                Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Or)))
-            }
-            0x85 => {
-                num_binop!(NumTy::I64);
-                Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Xor)))
-            }
-            0x86 => {
-                num_binop!(NumTy::I64);
-                Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Shl)))
-            }
-            0x87 => {
-                num_binop!(NumTy::I64);
-                Self::Num(Num::Int(
-                    IntTy::I64,
-                    NumIOp::Binary(IBinOp::Shr(SignExtension::Signed)),
-                ))
-            }
-            0x88 => {
-                num_binop!(NumTy::I64);
-                Self::Num(Num::Int(
-                    IntTy::I64,
-                    NumIOp::Binary(IBinOp::Shr(SignExtension::Unsigned)),
-                ))
-            }
-            0x89 => {
-                num_binop!(NumTy::I64);
-                Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Rotl)))
-            }
-            0x8a => {
-                num_binop!(NumTy::I64);
-                Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Rotr)))
-            }
-
-            // FP32 remaining operations
-            0x8b => {
-                num_unop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Abs)))
-            }
-            0x8c => {
-                num_unop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Neg)))
-            }
-            0x8d => {
-                num_unop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Ceil)))
-            }
-            0x8e => {
-                num_unop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Floor)))
-            }
-            0x8f => {
-                num_unop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Trunc)))
-            }
-            0x90 => {
-                num_unop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Nearest)))
-            }
-            0x91 => {
-                num_unop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Sqrt)))
-            }
-            0x92 => {
-                num_binop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Add)))
-            }
-            0x93 => {
-                num_binop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Sub)))
-            }
-            0x94 => {
-                num_binop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Mul)))
-            }
-            0x95 => {
-                num_binop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Div)))
-            }
-            0x96 => {
-                num_binop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Min)))
-            }
-            0x97 => {
-                num_binop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Max)))
-            }
-            0x98 => {
-                num_binop!(NumTy::F32);
-                Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::CopySign)))
-            }
-
-            // FP64 remaining operations
-            0x99 => {
-                num_unop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Abs)))
-            }
-            0x9a => {
-                num_unop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Neg)))
-            }
-            0x9b => {
-                num_unop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Ceil)))
-            }
-            0x9c => {
-                num_unop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Floor)))
-            }
-            0x9d => {
-                num_unop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Trunc)))
-            }
-            0x9e => {
-                num_unop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Nearest)))
-            }
-            0x9f => {
-                num_unop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Sqrt)))
-            }
-            0xa0 => {
-                num_binop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Add)))
-            }
-            0xa1 => {
-                num_binop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Sub)))
-            }
-            0xa2 => {
-                num_binop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Mul)))
-            }
-            0xa3 => {
-                num_binop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Div)))
-            }
-            0xa4 => {
-                num_binop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Min)))
-            }
-            0xa5 => {
-                num_binop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Max)))
-            }
-            0xa6 => {
-                num_binop!(NumTy::F64);
-                Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::CopySign)))
-            }
-
-            // Conversion
-            0xa7 => {
-                num_cvtop!(NumTy::I64, NumTy::I32);
-                Self::Num(Num::Conversion(CvtOp::I32WrapI64))
-            }
-            0xa8 => {
-                num_cvtop!(NumTy::F32, NumTy::I32);
-                Self::Num(Num::Conversion(CvtOp::Trunc(
-                    IntTy::I32,
-                    FloatTy::F32,
-                    SignExtension::Signed,
-                )))
-            }
-            0xa9 => {
-                num_cvtop!(NumTy::F32, NumTy::I32);
-                Self::Num(Num::Conversion(CvtOp::Trunc(
-                    IntTy::I32,
-                    FloatTy::F32,
-                    SignExtension::Unsigned,
-                )))
-            }
-            0xaa => {
-                num_cvtop!(NumTy::F64, NumTy::I32);
-                Self::Num(Num::Conversion(CvtOp::Trunc(
-                    IntTy::I32,
-                    FloatTy::F64,
-                    SignExtension::Signed,
-                )))
-            }
-            0xab => {
-                num_cvtop!(NumTy::F64, NumTy::I32);
-                Self::Num(Num::Conversion(CvtOp::Trunc(
-                    IntTy::I32,
-                    FloatTy::F64,
-                    SignExtension::Unsigned,
-                )))
-            }
-            0xac => {
-                num_cvtop!(NumTy::I32, NumTy::I64);
-                Self::Num(Num::Conversion(CvtOp::I64ExtendI32(SignExtension::Signed)))
-            }
-            0xad => {
-                num_cvtop!(NumTy::I32, NumTy::I64);
-                Self::Num(Num::Conversion(CvtOp::I64ExtendI32(
-                    SignExtension::Unsigned,
-                )))
-            }
-            0xae => {
-                num_cvtop!(NumTy::F32, NumTy::I64);
-                Self::Num(Num::Conversion(CvtOp::Trunc(
-                    IntTy::I64,
-                    FloatTy::F32,
-                    SignExtension::Signed,
-                )))
-            }
-            0xaf => {
-                num_cvtop!(NumTy::F32, NumTy::I64);
-                Self::Num(Num::Conversion(CvtOp::Trunc(
-                    IntTy::I64,
-                    FloatTy::F32,
-                    SignExtension::Unsigned,
-                )))
-            }
-            0xb0 => {
-                num_cvtop!(NumTy::F64, NumTy::I64);
-                Self::Num(Num::Conversion(CvtOp::Trunc(
-                    IntTy::I64,
-                    FloatTy::F64,
-                    SignExtension::Signed,
-                )))
-            }
-            0xb1 => {
-                num_cvtop!(NumTy::F64, NumTy::I64);
-                Self::Num(Num::Conversion(CvtOp::Trunc(
-                    IntTy::I64,
-                    FloatTy::F64,
-                    SignExtension::Unsigned,
-                )))
-            }
-            0xb2 => {
-                num_cvtop!(NumTy::I32, NumTy::F32);
-                Self::Num(Num::Conversion(CvtOp::Convert(
-                    FloatTy::F32,
-                    IntTy::I32,
-                    SignExtension::Signed,
-                )))
-            }
-            0xb3 => {
-                num_cvtop!(NumTy::I32, NumTy::F32);
-                Self::Num(Num::Conversion(CvtOp::Convert(
-                    FloatTy::F32,
-                    IntTy::I32,
-                    SignExtension::Unsigned,
-                )))
-            }
-            0xb4 => {
-                num_cvtop!(NumTy::I64, NumTy::F32);
-                Self::Num(Num::Conversion(CvtOp::Convert(
-                    FloatTy::F32,
-                    IntTy::I64,
-                    SignExtension::Signed,
-                )))
-            }
-            0xb5 => {
-                num_cvtop!(NumTy::I64, NumTy::F32);
-                Self::Num(Num::Conversion(CvtOp::Convert(
-                    FloatTy::F32,
-                    IntTy::I64,
-                    SignExtension::Unsigned,
-                )))
-            }
-            0xb6 => {
-                num_cvtop!(NumTy::F64, NumTy::F32);
-                Self::Num(Num::Conversion(CvtOp::F32DemoteF64))
-            }
-            0xb7 => {
-                num_cvtop!(NumTy::I32, NumTy::F64);
-                Self::Num(Num::Conversion(CvtOp::Convert(
-                    FloatTy::F64,
-                    IntTy::I32,
-                    SignExtension::Signed,
-                )))
-            }
-            0xb8 => {
-                num_cvtop!(NumTy::I32, NumTy::F64);
-                Self::Num(Num::Conversion(CvtOp::Convert(
-                    FloatTy::F64,
-                    IntTy::I32,
-                    SignExtension::Unsigned,
-                )))
-            }
-            0xb9 => {
-                num_cvtop!(NumTy::I64, NumTy::F64);
-                Self::Num(Num::Conversion(CvtOp::Convert(
-                    FloatTy::F64,
-                    IntTy::I64,
-                    SignExtension::Signed,
-                )))
-            }
-            0xba => {
-                num_cvtop!(NumTy::I64, NumTy::F64);
-                Self::Num(Num::Conversion(CvtOp::Convert(
-                    FloatTy::F64,
-                    IntTy::I64,
-                    SignExtension::Unsigned,
-                )))
-            }
-            0xbb => {
-                num_cvtop!(NumTy::F32, NumTy::F64);
-                Self::Num(Num::Conversion(CvtOp::F64PromoteF32))
-            }
-            0xbc => {
-                num_cvtop!(NumTy::F32, NumTy::I32);
-                Self::Num(Num::Conversion(CvtOp::I32ReinterpretF32))
-            }
-            0xbd => {
-                num_cvtop!(NumTy::F64, NumTy::I64);
-                Self::Num(Num::Conversion(CvtOp::I64ReinterpretF64))
-            }
-            0xbe => {
-                num_cvtop!(NumTy::I32, NumTy::F32);
-                Self::Num(Num::Conversion(CvtOp::F32ReinterpretI32))
-            }
-            0xbf => {
-                num_cvtop!(NumTy::I64, NumTy::F64);
-                Self::Num(Num::Conversion(CvtOp::F64ReinterpretI64))
-            }
-            0xc0 => {
-                num_unop!(NumTy::I32);
-                Self::Num(Num::Int(
-                    IntTy::I32,
-                    NumIOp::Unary(IUnOp::Extend(StorageSize::Size8)),
-                ))
-            }
-            0xc1 => {
-                num_unop!(NumTy::I32);
-                Self::Num(Num::Int(
-                    IntTy::I32,
-                    NumIOp::Unary(IUnOp::Extend(StorageSize::Size16)),
-                ))
-            }
-            0xc2 => {
-                num_unop!(NumTy::I64);
-                Self::Num(Num::Int(
-                    IntTy::I64,
-                    NumIOp::Unary(IUnOp::Extend(StorageSize::Size8)),
-                ))
-            }
-            0xc3 => {
-                num_unop!(NumTy::I64);
-                Self::Num(Num::Int(
-                    IntTy::I64,
-                    NumIOp::Unary(IUnOp::Extend(StorageSize::Size16)),
-                ))
-            }
-            0xc4 => {
-                num_unop!(NumTy::I64);
-                Self::Num(Num::Int(
-                    IntTy::I64,
-                    NumIOp::Unary(IUnOp::Extend(StorageSize::Size32)),
-                ))
-            }
-
-            // Extended Instructions
-            0xfc => match decode_u32(reader)? {
-                // Numeric Instructions
-                0 => {
-                    num_cvtop!(NumTy::F32, NumTy::I32);
-                    Self::Num(Num::Conversion(CvtOp::TruncSat(
-                        IntTy::I32,
-                        FloatTy::F32,
-                        SignExtension::Signed,
-                    )))
-                }
-                1 => {
-                    num_cvtop!(NumTy::F32, NumTy::I32);
-                    Self::Num(Num::Conversion(CvtOp::TruncSat(
-                        IntTy::I32,
-                        FloatTy::F32,
-                        SignExtension::Unsigned,
-                    )))
-                }
-                2 => {
-                    num_cvtop!(NumTy::F64, NumTy::I32);
-                    Self::Num(Num::Conversion(CvtOp::TruncSat(
-                        IntTy::I32,
-                        FloatTy::F64,
-                        SignExtension::Signed,
-                    )))
-                }
-                3 => {
-                    num_cvtop!(NumTy::F64, NumTy::I32);
-                    Self::Num(Num::Conversion(CvtOp::TruncSat(
-                        IntTy::I32,
-                        FloatTy::F64,
-                        SignExtension::Unsigned,
-                    )))
-                }
-                4 => {
-                    num_cvtop!(NumTy::F32, NumTy::I64);
-                    Self::Num(Num::Conversion(CvtOp::TruncSat(
-                        IntTy::I64,
-                        FloatTy::F32,
-                        SignExtension::Signed,
-                    )))
-                }
-                5 => {
-                    num_cvtop!(NumTy::F32, NumTy::I64);
-                    Self::Num(Num::Conversion(CvtOp::TruncSat(
-                        IntTy::I64,
-                        FloatTy::F32,
-                        SignExtension::Unsigned,
-                    )))
-                }
-                6 => {
-                    num_cvtop!(NumTy::F64, NumTy::I64);
-                    Self::Num(Num::Conversion(CvtOp::TruncSat(
-                        IntTy::I64,
-                        FloatTy::F64,
-                        SignExtension::Signed,
-                    )))
-                }
-                7 => {
-                    num_cvtop!(NumTy::F64, NumTy::I64);
-                    Self::Num(Num::Conversion(CvtOp::TruncSat(
-                        IntTy::I64,
-                        FloatTy::F64,
-                        SignExtension::Unsigned,
-                    )))
-                }
-
-                // Memory Instructions
-                8 => {
-                    let x = DataIndex::decode(reader, ctx)?;
-                    match reader.next()? {
-                        0x00 => {}
-                        _ => return Err(DecodeError::InvalidInstr),
+                    let t1 = validator.pop_val()?;
+                    if !t1.is_num() && !t1.is_vec() {
+                        return Err(DecodeError::InvalidExpr(ExprError::UnexpectedTy));
+                    }
+                    let t2 = validator.pop_val()?;
+                    if t1 != t2 && t1 != OpdTy::Unknown && t2 != OpdTy::Unknown {
+                        return Err(DecodeError::InvalidExpr(ExprError::UnexpectedTy));
                     }
 
-                    if !ctx.is_mem_valid(MemIndex(0)) {
-                        // TODO: Need more specific error
+                    validator.push_val(t1);
+
+                    Self::Parametric(Parametric::Select(None))
+                }
+                0x1c => {
+                    let t = decode_vec(reader, ValTy::decode)?;
+                    if t.len() != 1 {
+                        return Err(DecodeError::InvalidExpr(ExprError::UnexpectedTy));
+                    }
+                    let expected = t.iter().copied().map(Into::into).collect::<Vec<OpdTy>>();
+                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                    validator.pop_expect_vals(&expected)?;
+                    validator.pop_expect_vals(&expected)?;
+                    validator.push_vals(&expected);
+
+                    Self::Parametric(Parametric::Select(Some(t)))
+                }
+
+                // Variable Instructions
+                0x20 => {
+                    let x = LocalIndex::decode(reader)?;
+                    let Some(ty) = validator.local_idx(x) else {
+                        // TODO: Wrong error
                         return Err(DecodeError::InvalidInstr);
-                    }
-                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-
-                    Self::Mem(Mem::MemoryInit(x))
+                    };
+                    validator.push_val(ty);
+                    Self::Var(Variable::LocalGet(x))
                 }
-                9 => {
-                    let x = DataIndex::decode(reader, ctx)?;
-                    Self::Mem(Mem::DataDrop(x))
-                }
-                10 => {
-                    match reader.next()? {
-                        0x00 => {}
-                        _ => return Err(DecodeError::InvalidInstr),
-                    }
-                    match reader.next()? {
-                        0x00 => {}
-                        _ => return Err(DecodeError::InvalidInstr),
-                    }
-
-                    if !ctx.is_mem_valid(MemIndex(0)) {
-                        // TODO: Need more specific error
+                0x21 => {
+                    let x = LocalIndex::decode(reader)?;
+                    let Some(ty) = validator.local_idx(x) else {
+                        // TODO: Wrong error
                         return Err(DecodeError::InvalidInstr);
-                    }
-                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-
-                    Self::Mem(Mem::MemoryCopy)
+                    };
+                    validator.pop_expect_val(ty)?;
+                    Self::Var(Variable::LocalSet(x))
                 }
-                11 => {
-                    match reader.next()? {
-                        0x00 => {}
-                        _ => return Err(DecodeError::InvalidInstr),
-                    }
-
-                    if !ctx.is_mem_valid(MemIndex(0)) {
-                        // TODO: Need more specific error
+                0x22 => {
+                    let x = LocalIndex::decode(reader)?;
+                    let Some(ty) = validator.local_idx(x) else {
+                        // TODO: Wrong error
                         return Err(DecodeError::InvalidInstr);
-                    }
-                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                    };
+                    validator.pop_expect_val(ty)?;
+                    validator.push_val(ty);
+                    Self::Var(Variable::LocalTee(x))
+                }
+                0x23 => {
+                    let x = GlobalIndex::decode(reader, ctx)?;
+                    // XXX Did another verifiation of GlobalIndex
+                    let Some(ty) = ctx.global_ty(x) else {
+                        return Err(DecodeError::InvalidGlobalIndex);
+                    };
+                    validator.push_val(ty.t.into());
 
-                    Self::Mem(Mem::MemoryFill)
+                    Self::Var(Variable::GlobalGet(x))
+                }
+                0x24 => {
+                    let x = GlobalIndex::decode(reader, ctx)?;
+                    // XXX Did another verifiation of GlobalIndex
+                    let Some(ty) = ctx.global_ty(x) else {
+                        return Err(DecodeError::InvalidGlobalIndex);
+                    };
+
+                    match ty.m {
+                        Mut::Const => return Err(DecodeError::InvalidInstr),
+                        Mut::Var => {}
+                    }
+                    validator.pop_expect_val(ty.t.into())?;
+
+                    Self::Var(Variable::GlobalSet(x))
                 }
 
                 // Table Instructions
-                12 => {
-                    let y = ElementIndex::decode(reader, ctx)?;
-                    let Some(elem) = ctx.elem(y) else {
-                        return Err(DecodeError::InvalidElementIndex);
-                    };
-
+                0x25 => {
                     let x = TableIndex::decode(reader, ctx)?;
-                    let Some(table_ty) = ctx.table_ty(x) else {
+
+                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                    let Some(ty) = ctx.table_ty(x) else {
                         return Err(DecodeError::InvalidTableIndex);
                     };
+                    validator.push_val(OpdTy::Ref(ty.elem_ty));
 
-                    if elem.ty != table_ty.elem_ty {
-                        // TODO: Need different error
+                    Self::Table(Table::TableGet(x))
+                }
+                0x26 => {
+                    let x = TableIndex::decode(reader, ctx)?;
+
+                    let Some(ty) = ctx.table_ty(x) else {
+                        return Err(DecodeError::InvalidTableIndex);
+                    };
+                    validator.pop_expect_val(OpdTy::Ref(ty.elem_ty))?;
+                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+
+                    Self::Table(Table::TableSet(x))
+                }
+
+                // Memory Instructions
+                0x28 => {
+                    let m = MemArg::decode(reader)?;
+                    mem_load!(NumTy::I32, m.align, 32u32);
+                    Self::Mem(Mem::Load(NumTy::I32, m, None))
+                }
+                0x29 => {
+                    let m = MemArg::decode(reader)?;
+                    mem_load!(NumTy::I64, m.align, 64u32);
+                    Self::Mem(Mem::Load(NumTy::I64, m, None))
+                }
+                0x2a => {
+                    let m = MemArg::decode(reader)?;
+                    mem_load!(NumTy::F32, m.align, 32u32);
+                    Self::Mem(Mem::Load(NumTy::F32, m, None))
+                }
+                0x2b => {
+                    let m = MemArg::decode(reader)?;
+                    mem_load!(NumTy::F64, m.align, 64u32);
+                    Self::Mem(Mem::Load(NumTy::F64, m, None))
+                }
+                0x2c => {
+                    let m = MemArg::decode(reader)?;
+                    mem_load!(NumTy::I32, m.align, 8u32);
+                    Self::Mem(Mem::Load(
+                        NumTy::I32,
+                        m,
+                        Some((StorageSize::Size8, SignExtension::Signed)),
+                    ))
+                }
+                0x2d => {
+                    let m = MemArg::decode(reader)?;
+                    mem_load!(NumTy::I32, m.align, 8u32);
+                    Self::Mem(Mem::Load(
+                        NumTy::I32,
+                        m,
+                        Some((StorageSize::Size8, SignExtension::Unsigned)),
+                    ))
+                }
+                0x2e => {
+                    let m = MemArg::decode(reader)?;
+                    mem_load!(NumTy::I32, m.align, 16u32);
+                    Self::Mem(Mem::Load(
+                        NumTy::I32,
+                        m,
+                        Some((StorageSize::Size16, SignExtension::Signed)),
+                    ))
+                }
+                0x2f => {
+                    let m = MemArg::decode(reader)?;
+                    mem_load!(NumTy::I32, m.align, 16u32);
+                    Self::Mem(Mem::Load(
+                        NumTy::I32,
+                        m,
+                        Some((StorageSize::Size16, SignExtension::Unsigned)),
+                    ))
+                }
+                0x30 => {
+                    let m = MemArg::decode(reader)?;
+                    mem_load!(NumTy::I64, m.align, 8u32);
+                    Self::Mem(Mem::Load(
+                        NumTy::I64,
+                        m,
+                        Some((StorageSize::Size8, SignExtension::Signed)),
+                    ))
+                }
+                0x31 => {
+                    let m = MemArg::decode(reader)?;
+                    mem_load!(NumTy::I64, m.align, 8u32);
+                    Self::Mem(Mem::Load(
+                        NumTy::I64,
+                        m,
+                        Some((StorageSize::Size8, SignExtension::Unsigned)),
+                    ))
+                }
+                0x32 => {
+                    let m = MemArg::decode(reader)?;
+                    mem_load!(NumTy::I64, m.align, 16u32);
+                    Self::Mem(Mem::Load(
+                        NumTy::I64,
+                        m,
+                        Some((StorageSize::Size16, SignExtension::Signed)),
+                    ))
+                }
+                0x33 => {
+                    let m = MemArg::decode(reader)?;
+                    mem_load!(NumTy::I64, m.align, 16u32);
+                    Self::Mem(Mem::Load(
+                        NumTy::I64,
+                        m,
+                        Some((StorageSize::Size16, SignExtension::Unsigned)),
+                    ))
+                }
+                0x34 => {
+                    let m = MemArg::decode(reader)?;
+                    mem_load!(NumTy::I64, m.align, 32u32);
+                    Self::Mem(Mem::Load(
+                        NumTy::I64,
+                        m,
+                        Some((StorageSize::Size32, SignExtension::Signed)),
+                    ))
+                }
+                0x35 => {
+                    let m = MemArg::decode(reader)?;
+                    mem_load!(NumTy::I64, m.align, 32u32);
+                    Self::Mem(Mem::Load(
+                        NumTy::I64,
+                        m,
+                        Some((StorageSize::Size32, SignExtension::Unsigned)),
+                    ))
+                }
+                0x36 => {
+                    let m = MemArg::decode(reader)?;
+                    mem_store!(NumTy::I32, m.align, 32u32);
+                    Self::Mem(Mem::Store(NumTy::I32, m, None))
+                }
+                0x37 => {
+                    let m = MemArg::decode(reader)?;
+                    mem_store!(NumTy::I64, m.align, 64u32);
+                    Self::Mem(Mem::Store(NumTy::I64, m, None))
+                }
+                0x38 => {
+                    let m = MemArg::decode(reader)?;
+                    mem_store!(NumTy::F32, m.align, 32u32);
+                    Self::Mem(Mem::Store(NumTy::F32, m, None))
+                }
+                0x39 => {
+                    let m = MemArg::decode(reader)?;
+                    mem_store!(NumTy::F64, m.align, 64u32);
+                    Self::Mem(Mem::Store(NumTy::F64, m, None))
+                }
+                0x3A => {
+                    let m = MemArg::decode(reader)?;
+                    mem_store!(NumTy::I32, m.align, 8u32);
+                    Self::Mem(Mem::Store(NumTy::I32, m, Some(StorageSize::Size8)))
+                }
+                0x3B => {
+                    let m = MemArg::decode(reader)?;
+                    mem_store!(NumTy::I32, m.align, 16u32);
+                    Self::Mem(Mem::Store(NumTy::I32, m, Some(StorageSize::Size16)))
+                }
+                0x3C => {
+                    let m = MemArg::decode(reader)?;
+                    mem_store!(NumTy::I64, m.align, 8u32);
+                    Self::Mem(Mem::Store(NumTy::I64, m, Some(StorageSize::Size8)))
+                }
+                0x3D => {
+                    let m = MemArg::decode(reader)?;
+                    mem_store!(NumTy::I64, m.align, 16u32);
+                    Self::Mem(Mem::Store(NumTy::I64, m, Some(StorageSize::Size16)))
+                }
+                0x3E => {
+                    let m = MemArg::decode(reader)?;
+                    mem_store!(NumTy::I64, m.align, 32u32);
+                    Self::Mem(Mem::Store(NumTy::I64, m, Some(StorageSize::Size32)))
+                }
+                0x3F => {
+                    match reader.next()? {
+                        0x00 => {}
+                        _ => return Err(DecodeError::InvalidInstr),
+                    }
+
+                    if !ctx.is_mem_valid(MemIndex(0)) {
+                        // TODO: Need more specific error
                         return Err(DecodeError::InvalidInstr);
                     }
 
-                    // TODO: Is it better to combine this or to have function take an iterator?
-                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                    validator.push_val(OpdTy::Num(NumTy::I32));
 
-                    Self::Table(Table::TableInit { elem: y, table: x })
+                    Self::Mem(Mem::MemorySize)
                 }
-                13 => {
-                    let x = ElementIndex::decode(reader, ctx)?;
-                    Self::Table(Table::ElemDrop(x))
-                }
-                14 => {
-                    let x = TableIndex::decode(reader, ctx)?;
-                    let y = TableIndex::decode(reader, ctx)?;
-
-                    let Some(x_table_ty) = ctx.table_ty(x) else {
-                        return Err(DecodeError::InvalidTableIndex);
-                    };
-                    let Some(y_table_ty) = ctx.table_ty(y) else {
-                        return Err(DecodeError::InvalidTableIndex);
-                    };
-
-                    if x_table_ty.elem_ty != y_table_ty.elem_ty {
-                        // TODO: Need different error
-                        return Err(DecodeError::InvalidInstr);
+                0x40 => {
+                    match reader.next()? {
+                        0x00 => {}
+                        _ => return Err(DecodeError::InvalidInstr),
                     }
 
-                    // TODO: Is it better to combine this or to have function take an iterator?
+                    if !ctx.is_mem_valid(MemIndex(0)) {
+                        // TODO: Need more specific error
+                        return Err(DecodeError::InvalidInstr);
+                    }
                     validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-
-                    Self::Table(Table::TableCopy { x, y })
-                }
-                15 => {
-                    let x = TableIndex::decode(reader, ctx)?;
-
-                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                    let Some(table_ty) = ctx.table_ty(x) else {
-                        return Err(DecodeError::InvalidTableIndex);
-                    };
-                    validator.pop_expect_val(OpdTy::Ref(table_ty.elem_ty))?;
                     validator.push_val(OpdTy::Num(NumTy::I32));
 
-                    Self::Table(Table::TableGrow(x))
+                    Self::Mem(Mem::MemoryGrow)
                 }
-                16 => {
-                    let x = TableIndex::decode(reader, ctx)?;
 
-                    validator.push_val(OpdTy::Num(NumTy::I32));
-
-                    Self::Table(Table::TableSize(x))
+                // Numeric Instructions
+                0x41 => {
+                    let n = decode_s32(reader)?;
+                    num_const!(NumTy::I32);
+                    Self::Num(Num::Constant(Const::I32(n)))
                 }
-                17 => {
-                    let x = TableIndex::decode(reader, ctx)?;
+                0x42 => {
+                    let n = decode_s64(reader)?;
+                    num_const!(NumTy::I64);
+                    Self::Num(Num::Constant(Const::I64(n)))
+                }
+                0x43 => {
+                    let n = decode_f32(reader)?;
+                    num_const!(NumTy::F32);
+                    Self::Num(Num::Constant(Const::F32(n)))
+                }
+                0x44 => {
+                    let n = decode_f64(reader)?;
+                    num_const!(NumTy::F64);
+                    Self::Num(Num::Constant(Const::F64(n)))
+                }
+                // I32 Test Operations
+                0x45 => {
+                    num_testop!(NumTy::I32);
+                    Self::Num(Num::Int(IntTy::I32, NumIOp::Test(ITestOp::Eqz)))
+                }
 
-                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                    let Some(table_ty) = ctx.table_ty(x) else {
-                        return Err(DecodeError::InvalidTableIndex);
-                    };
-                    validator.pop_expect_val(OpdTy::Ref(table_ty.elem_ty))?;
-                    validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                // I32 Comparision operations
+                0x46 => {
+                    num_relop!(NumTy::I32);
+                    Self::Num(Num::Int(IntTy::I32, NumIOp::Rel(IRelOp::Eq)))
+                }
+                0x47 => {
+                    num_relop!(NumTy::I32);
+                    Self::Num(Num::Int(IntTy::I32, NumIOp::Rel(IRelOp::Ne)))
+                }
+                0x48 => {
+                    num_relop!(NumTy::I32);
+                    Self::Num(Num::Int(
+                        IntTy::I32,
+                        NumIOp::Rel(IRelOp::Lt(SignExtension::Signed)),
+                    ))
+                }
+                0x49 => {
+                    num_relop!(NumTy::I32);
+                    Self::Num(Num::Int(
+                        IntTy::I32,
+                        NumIOp::Rel(IRelOp::Lt(SignExtension::Unsigned)),
+                    ))
+                }
+                0x4a => {
+                    num_relop!(NumTy::I32);
+                    Self::Num(Num::Int(
+                        IntTy::I32,
+                        NumIOp::Rel(IRelOp::Gt(SignExtension::Signed)),
+                    ))
+                }
+                0x4b => {
+                    num_relop!(NumTy::I32);
+                    Self::Num(Num::Int(
+                        IntTy::I32,
+                        NumIOp::Rel(IRelOp::Gt(SignExtension::Unsigned)),
+                    ))
+                }
+                0x4c => {
+                    num_relop!(NumTy::I32);
+                    Self::Num(Num::Int(
+                        IntTy::I32,
+                        NumIOp::Rel(IRelOp::Le(SignExtension::Signed)),
+                    ))
+                }
+                0x4d => {
+                    num_relop!(NumTy::I32);
+                    Self::Num(Num::Int(
+                        IntTy::I32,
+                        NumIOp::Rel(IRelOp::Le(SignExtension::Unsigned)),
+                    ))
+                }
+                0x4e => {
+                    num_relop!(NumTy::I32);
+                    Self::Num(Num::Int(
+                        IntTy::I32,
+                        NumIOp::Rel(IRelOp::Ge(SignExtension::Signed)),
+                    ))
+                }
+                0x4f => {
+                    num_relop!(NumTy::I32);
+                    Self::Num(Num::Int(
+                        IntTy::I32,
+                        NumIOp::Rel(IRelOp::Ge(SignExtension::Unsigned)),
+                    ))
+                }
 
-                    Self::Table(Table::TableFill(x))
+                // I64 Test Operations
+                0x50 => {
+                    num_testop!(NumTy::I64);
+                    Self::Num(Num::Int(IntTy::I64, NumIOp::Test(ITestOp::Eqz)))
+                }
+
+                // I64 Comparision operations
+                0x51 => {
+                    num_relop!(NumTy::I64);
+                    Self::Num(Num::Int(IntTy::I64, NumIOp::Rel(IRelOp::Eq)))
+                }
+                0x52 => {
+                    num_relop!(NumTy::I64);
+                    Self::Num(Num::Int(IntTy::I64, NumIOp::Rel(IRelOp::Ne)))
+                }
+                0x53 => {
+                    num_relop!(NumTy::I64);
+                    Self::Num(Num::Int(
+                        IntTy::I64,
+                        NumIOp::Rel(IRelOp::Lt(SignExtension::Signed)),
+                    ))
+                }
+                0x54 => {
+                    num_relop!(NumTy::I64);
+                    Self::Num(Num::Int(
+                        IntTy::I64,
+                        NumIOp::Rel(IRelOp::Lt(SignExtension::Unsigned)),
+                    ))
+                }
+                0x55 => {
+                    num_relop!(NumTy::I64);
+                    Self::Num(Num::Int(
+                        IntTy::I64,
+                        NumIOp::Rel(IRelOp::Gt(SignExtension::Signed)),
+                    ))
+                }
+                0x56 => {
+                    num_relop!(NumTy::I64);
+                    Self::Num(Num::Int(
+                        IntTy::I64,
+                        NumIOp::Rel(IRelOp::Gt(SignExtension::Unsigned)),
+                    ))
+                }
+                0x57 => {
+                    num_relop!(NumTy::I64);
+                    Self::Num(Num::Int(
+                        IntTy::I64,
+                        NumIOp::Rel(IRelOp::Le(SignExtension::Signed)),
+                    ))
+                }
+                0x58 => {
+                    num_relop!(NumTy::I64);
+                    Self::Num(Num::Int(
+                        IntTy::I64,
+                        NumIOp::Rel(IRelOp::Le(SignExtension::Unsigned)),
+                    ))
+                }
+                0x59 => {
+                    num_relop!(NumTy::I64);
+                    Self::Num(Num::Int(
+                        IntTy::I64,
+                        NumIOp::Rel(IRelOp::Ge(SignExtension::Signed)),
+                    ))
+                }
+                0x5a => {
+                    num_relop!(NumTy::I64);
+                    Self::Num(Num::Int(
+                        IntTy::I64,
+                        NumIOp::Rel(IRelOp::Ge(SignExtension::Unsigned)),
+                    ))
+                }
+
+                // F32 Comparision operations
+                0x5b => {
+                    num_relop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Eq)))
+                }
+                0x5c => {
+                    num_relop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Ne)))
+                }
+                0x5d => {
+                    num_relop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Lt)))
+                }
+                0x5e => {
+                    num_relop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Gt)))
+                }
+                0x5f => {
+                    num_relop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Le)))
+                }
+                0x60 => {
+                    num_relop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Ge)))
+                }
+
+                // F64 Comparision operations
+                0x61 => {
+                    num_relop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Eq)))
+                }
+                0x62 => {
+                    num_relop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Ne)))
+                }
+                0x63 => {
+                    num_relop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Lt)))
+                }
+                0x64 => {
+                    num_relop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Gt)))
+                }
+                0x65 => {
+                    num_relop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Le)))
+                }
+                0x66 => {
+                    num_relop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Ge)))
+                }
+
+                // I32 remaining operations
+                0x67 => {
+                    num_unop!(NumTy::I32);
+                    Self::Num(Num::Int(IntTy::I32, NumIOp::Unary(IUnOp::Clz)))
+                }
+                0x68 => {
+                    num_unop!(NumTy::I32);
+                    Self::Num(Num::Int(IntTy::I32, NumIOp::Unary(IUnOp::Ctz)))
+                }
+                0x69 => {
+                    num_unop!(NumTy::I32);
+                    Self::Num(Num::Int(IntTy::I32, NumIOp::Unary(IUnOp::PopCnt)))
+                }
+                0x6a => {
+                    num_binop!(NumTy::I32);
+                    Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Add)))
+                }
+                0x6b => {
+                    num_binop!(NumTy::I32);
+                    Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Sub)))
+                }
+                0x6c => {
+                    num_binop!(NumTy::I32);
+                    Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Mul)))
+                }
+                0x6d => {
+                    num_binop!(NumTy::I32);
+                    Self::Num(Num::Int(
+                        IntTy::I32,
+                        NumIOp::Binary(IBinOp::Div(SignExtension::Signed)),
+                    ))
+                }
+                0x6e => {
+                    num_binop!(NumTy::I32);
+                    Self::Num(Num::Int(
+                        IntTy::I32,
+                        NumIOp::Binary(IBinOp::Div(SignExtension::Unsigned)),
+                    ))
+                }
+                0x6f => {
+                    num_binop!(NumTy::I32);
+                    Self::Num(Num::Int(
+                        IntTy::I32,
+                        NumIOp::Binary(IBinOp::Rem(SignExtension::Signed)),
+                    ))
+                }
+                0x70 => {
+                    num_binop!(NumTy::I32);
+                    Self::Num(Num::Int(
+                        IntTy::I32,
+                        NumIOp::Binary(IBinOp::Rem(SignExtension::Unsigned)),
+                    ))
+                }
+                0x71 => {
+                    num_binop!(NumTy::I32);
+                    Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::And)))
+                }
+                0x72 => {
+                    num_binop!(NumTy::I32);
+                    Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Or)))
+                }
+                0x73 => {
+                    num_binop!(NumTy::I32);
+                    Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Xor)))
+                }
+                0x74 => {
+                    num_binop!(NumTy::I32);
+                    Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Shl)))
+                }
+                0x75 => {
+                    num_binop!(NumTy::I32);
+                    Self::Num(Num::Int(
+                        IntTy::I32,
+                        NumIOp::Binary(IBinOp::Shr(SignExtension::Signed)),
+                    ))
+                }
+                0x76 => {
+                    num_binop!(NumTy::I32);
+                    Self::Num(Num::Int(
+                        IntTy::I32,
+                        NumIOp::Binary(IBinOp::Shr(SignExtension::Unsigned)),
+                    ))
+                }
+                0x77 => {
+                    num_binop!(NumTy::I32);
+                    Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Rotl)))
+                }
+                0x78 => {
+                    num_binop!(NumTy::I32);
+                    Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Rotr)))
+                }
+
+                // I64 remaining operations
+                0x79 => {
+                    num_unop!(NumTy::I64);
+                    Self::Num(Num::Int(IntTy::I64, NumIOp::Unary(IUnOp::Clz)))
+                }
+                0x7a => {
+                    num_unop!(NumTy::I64);
+                    Self::Num(Num::Int(IntTy::I64, NumIOp::Unary(IUnOp::Ctz)))
+                }
+                0x7b => {
+                    num_unop!(NumTy::I64);
+                    Self::Num(Num::Int(IntTy::I64, NumIOp::Unary(IUnOp::PopCnt)))
+                }
+                0x7c => {
+                    num_binop!(NumTy::I64);
+                    Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Add)))
+                }
+                0x7d => {
+                    num_binop!(NumTy::I64);
+                    Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Sub)))
+                }
+                0x7e => {
+                    num_binop!(NumTy::I64);
+                    Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Mul)))
+                }
+                0x7f => {
+                    num_binop!(NumTy::I64);
+                    Self::Num(Num::Int(
+                        IntTy::I64,
+                        NumIOp::Binary(IBinOp::Div(SignExtension::Signed)),
+                    ))
+                }
+                0x80 => {
+                    num_binop!(NumTy::I64);
+                    Self::Num(Num::Int(
+                        IntTy::I64,
+                        NumIOp::Binary(IBinOp::Div(SignExtension::Unsigned)),
+                    ))
+                }
+                0x81 => {
+                    num_binop!(NumTy::I64);
+                    Self::Num(Num::Int(
+                        IntTy::I64,
+                        NumIOp::Binary(IBinOp::Rem(SignExtension::Signed)),
+                    ))
+                }
+                0x82 => {
+                    num_binop!(NumTy::I64);
+                    Self::Num(Num::Int(
+                        IntTy::I64,
+                        NumIOp::Binary(IBinOp::Rem(SignExtension::Unsigned)),
+                    ))
+                }
+                0x83 => {
+                    num_binop!(NumTy::I64);
+                    Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::And)))
+                }
+                0x84 => {
+                    num_binop!(NumTy::I64);
+                    Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Or)))
+                }
+                0x85 => {
+                    num_binop!(NumTy::I64);
+                    Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Xor)))
+                }
+                0x86 => {
+                    num_binop!(NumTy::I64);
+                    Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Shl)))
+                }
+                0x87 => {
+                    num_binop!(NumTy::I64);
+                    Self::Num(Num::Int(
+                        IntTy::I64,
+                        NumIOp::Binary(IBinOp::Shr(SignExtension::Signed)),
+                    ))
+                }
+                0x88 => {
+                    num_binop!(NumTy::I64);
+                    Self::Num(Num::Int(
+                        IntTy::I64,
+                        NumIOp::Binary(IBinOp::Shr(SignExtension::Unsigned)),
+                    ))
+                }
+                0x89 => {
+                    num_binop!(NumTy::I64);
+                    Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Rotl)))
+                }
+                0x8a => {
+                    num_binop!(NumTy::I64);
+                    Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Rotr)))
+                }
+
+                // FP32 remaining operations
+                0x8b => {
+                    num_unop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Abs)))
+                }
+                0x8c => {
+                    num_unop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Neg)))
+                }
+                0x8d => {
+                    num_unop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Ceil)))
+                }
+                0x8e => {
+                    num_unop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Floor)))
+                }
+                0x8f => {
+                    num_unop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Trunc)))
+                }
+                0x90 => {
+                    num_unop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Nearest)))
+                }
+                0x91 => {
+                    num_unop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Sqrt)))
+                }
+                0x92 => {
+                    num_binop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Add)))
+                }
+                0x93 => {
+                    num_binop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Sub)))
+                }
+                0x94 => {
+                    num_binop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Mul)))
+                }
+                0x95 => {
+                    num_binop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Div)))
+                }
+                0x96 => {
+                    num_binop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Min)))
+                }
+                0x97 => {
+                    num_binop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Max)))
+                }
+                0x98 => {
+                    num_binop!(NumTy::F32);
+                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::CopySign)))
+                }
+
+                // FP64 remaining operations
+                0x99 => {
+                    num_unop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Abs)))
+                }
+                0x9a => {
+                    num_unop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Neg)))
+                }
+                0x9b => {
+                    num_unop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Ceil)))
+                }
+                0x9c => {
+                    num_unop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Floor)))
+                }
+                0x9d => {
+                    num_unop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Trunc)))
+                }
+                0x9e => {
+                    num_unop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Nearest)))
+                }
+                0x9f => {
+                    num_unop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Sqrt)))
+                }
+                0xa0 => {
+                    num_binop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Add)))
+                }
+                0xa1 => {
+                    num_binop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Sub)))
+                }
+                0xa2 => {
+                    num_binop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Mul)))
+                }
+                0xa3 => {
+                    num_binop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Div)))
+                }
+                0xa4 => {
+                    num_binop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Min)))
+                }
+                0xa5 => {
+                    num_binop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Max)))
+                }
+                0xa6 => {
+                    num_binop!(NumTy::F64);
+                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::CopySign)))
+                }
+
+                // Conversion
+                0xa7 => {
+                    num_cvtop!(NumTy::I64, NumTy::I32);
+                    Self::Num(Num::Conversion(CvtOp::I32WrapI64))
+                }
+                0xa8 => {
+                    num_cvtop!(NumTy::F32, NumTy::I32);
+                    Self::Num(Num::Conversion(CvtOp::Trunc(
+                        IntTy::I32,
+                        FloatTy::F32,
+                        SignExtension::Signed,
+                    )))
+                }
+                0xa9 => {
+                    num_cvtop!(NumTy::F32, NumTy::I32);
+                    Self::Num(Num::Conversion(CvtOp::Trunc(
+                        IntTy::I32,
+                        FloatTy::F32,
+                        SignExtension::Unsigned,
+                    )))
+                }
+                0xaa => {
+                    num_cvtop!(NumTy::F64, NumTy::I32);
+                    Self::Num(Num::Conversion(CvtOp::Trunc(
+                        IntTy::I32,
+                        FloatTy::F64,
+                        SignExtension::Signed,
+                    )))
+                }
+                0xab => {
+                    num_cvtop!(NumTy::F64, NumTy::I32);
+                    Self::Num(Num::Conversion(CvtOp::Trunc(
+                        IntTy::I32,
+                        FloatTy::F64,
+                        SignExtension::Unsigned,
+                    )))
+                }
+                0xac => {
+                    num_cvtop!(NumTy::I32, NumTy::I64);
+                    Self::Num(Num::Conversion(CvtOp::I64ExtendI32(SignExtension::Signed)))
+                }
+                0xad => {
+                    num_cvtop!(NumTy::I32, NumTy::I64);
+                    Self::Num(Num::Conversion(CvtOp::I64ExtendI32(
+                        SignExtension::Unsigned,
+                    )))
+                }
+                0xae => {
+                    num_cvtop!(NumTy::F32, NumTy::I64);
+                    Self::Num(Num::Conversion(CvtOp::Trunc(
+                        IntTy::I64,
+                        FloatTy::F32,
+                        SignExtension::Signed,
+                    )))
+                }
+                0xaf => {
+                    num_cvtop!(NumTy::F32, NumTy::I64);
+                    Self::Num(Num::Conversion(CvtOp::Trunc(
+                        IntTy::I64,
+                        FloatTy::F32,
+                        SignExtension::Unsigned,
+                    )))
+                }
+                0xb0 => {
+                    num_cvtop!(NumTy::F64, NumTy::I64);
+                    Self::Num(Num::Conversion(CvtOp::Trunc(
+                        IntTy::I64,
+                        FloatTy::F64,
+                        SignExtension::Signed,
+                    )))
+                }
+                0xb1 => {
+                    num_cvtop!(NumTy::F64, NumTy::I64);
+                    Self::Num(Num::Conversion(CvtOp::Trunc(
+                        IntTy::I64,
+                        FloatTy::F64,
+                        SignExtension::Unsigned,
+                    )))
+                }
+                0xb2 => {
+                    num_cvtop!(NumTy::I32, NumTy::F32);
+                    Self::Num(Num::Conversion(CvtOp::Convert(
+                        FloatTy::F32,
+                        IntTy::I32,
+                        SignExtension::Signed,
+                    )))
+                }
+                0xb3 => {
+                    num_cvtop!(NumTy::I32, NumTy::F32);
+                    Self::Num(Num::Conversion(CvtOp::Convert(
+                        FloatTy::F32,
+                        IntTy::I32,
+                        SignExtension::Unsigned,
+                    )))
+                }
+                0xb4 => {
+                    num_cvtop!(NumTy::I64, NumTy::F32);
+                    Self::Num(Num::Conversion(CvtOp::Convert(
+                        FloatTy::F32,
+                        IntTy::I64,
+                        SignExtension::Signed,
+                    )))
+                }
+                0xb5 => {
+                    num_cvtop!(NumTy::I64, NumTy::F32);
+                    Self::Num(Num::Conversion(CvtOp::Convert(
+                        FloatTy::F32,
+                        IntTy::I64,
+                        SignExtension::Unsigned,
+                    )))
+                }
+                0xb6 => {
+                    num_cvtop!(NumTy::F64, NumTy::F32);
+                    Self::Num(Num::Conversion(CvtOp::F32DemoteF64))
+                }
+                0xb7 => {
+                    num_cvtop!(NumTy::I32, NumTy::F64);
+                    Self::Num(Num::Conversion(CvtOp::Convert(
+                        FloatTy::F64,
+                        IntTy::I32,
+                        SignExtension::Signed,
+                    )))
+                }
+                0xb8 => {
+                    num_cvtop!(NumTy::I32, NumTy::F64);
+                    Self::Num(Num::Conversion(CvtOp::Convert(
+                        FloatTy::F64,
+                        IntTy::I32,
+                        SignExtension::Unsigned,
+                    )))
+                }
+                0xb9 => {
+                    num_cvtop!(NumTy::I64, NumTy::F64);
+                    Self::Num(Num::Conversion(CvtOp::Convert(
+                        FloatTy::F64,
+                        IntTy::I64,
+                        SignExtension::Signed,
+                    )))
+                }
+                0xba => {
+                    num_cvtop!(NumTy::I64, NumTy::F64);
+                    Self::Num(Num::Conversion(CvtOp::Convert(
+                        FloatTy::F64,
+                        IntTy::I64,
+                        SignExtension::Unsigned,
+                    )))
+                }
+                0xbb => {
+                    num_cvtop!(NumTy::F32, NumTy::F64);
+                    Self::Num(Num::Conversion(CvtOp::F64PromoteF32))
+                }
+                0xbc => {
+                    num_cvtop!(NumTy::F32, NumTy::I32);
+                    Self::Num(Num::Conversion(CvtOp::I32ReinterpretF32))
+                }
+                0xbd => {
+                    num_cvtop!(NumTy::F64, NumTy::I64);
+                    Self::Num(Num::Conversion(CvtOp::I64ReinterpretF64))
+                }
+                0xbe => {
+                    num_cvtop!(NumTy::I32, NumTy::F32);
+                    Self::Num(Num::Conversion(CvtOp::F32ReinterpretI32))
+                }
+                0xbf => {
+                    num_cvtop!(NumTy::I64, NumTy::F64);
+                    Self::Num(Num::Conversion(CvtOp::F64ReinterpretI64))
+                }
+                0xc0 => {
+                    num_unop!(NumTy::I32);
+                    Self::Num(Num::Int(
+                        IntTy::I32,
+                        NumIOp::Unary(IUnOp::Extend(StorageSize::Size8)),
+                    ))
+                }
+                0xc1 => {
+                    num_unop!(NumTy::I32);
+                    Self::Num(Num::Int(
+                        IntTy::I32,
+                        NumIOp::Unary(IUnOp::Extend(StorageSize::Size16)),
+                    ))
+                }
+                0xc2 => {
+                    num_unop!(NumTy::I64);
+                    Self::Num(Num::Int(
+                        IntTy::I64,
+                        NumIOp::Unary(IUnOp::Extend(StorageSize::Size8)),
+                    ))
+                }
+                0xc3 => {
+                    num_unop!(NumTy::I64);
+                    Self::Num(Num::Int(
+                        IntTy::I64,
+                        NumIOp::Unary(IUnOp::Extend(StorageSize::Size16)),
+                    ))
+                }
+                0xc4 => {
+                    num_unop!(NumTy::I64);
+                    Self::Num(Num::Int(
+                        IntTy::I64,
+                        NumIOp::Unary(IUnOp::Extend(StorageSize::Size32)),
+                    ))
+                }
+
+                // Extended Instructions
+                0xfc => match decode_u32(reader)? {
+                    // Numeric Instructions
+                    0 => {
+                        num_cvtop!(NumTy::F32, NumTy::I32);
+                        Self::Num(Num::Conversion(CvtOp::TruncSat(
+                            IntTy::I32,
+                            FloatTy::F32,
+                            SignExtension::Signed,
+                        )))
+                    }
+                    1 => {
+                        num_cvtop!(NumTy::F32, NumTy::I32);
+                        Self::Num(Num::Conversion(CvtOp::TruncSat(
+                            IntTy::I32,
+                            FloatTy::F32,
+                            SignExtension::Unsigned,
+                        )))
+                    }
+                    2 => {
+                        num_cvtop!(NumTy::F64, NumTy::I32);
+                        Self::Num(Num::Conversion(CvtOp::TruncSat(
+                            IntTy::I32,
+                            FloatTy::F64,
+                            SignExtension::Signed,
+                        )))
+                    }
+                    3 => {
+                        num_cvtop!(NumTy::F64, NumTy::I32);
+                        Self::Num(Num::Conversion(CvtOp::TruncSat(
+                            IntTy::I32,
+                            FloatTy::F64,
+                            SignExtension::Unsigned,
+                        )))
+                    }
+                    4 => {
+                        num_cvtop!(NumTy::F32, NumTy::I64);
+                        Self::Num(Num::Conversion(CvtOp::TruncSat(
+                            IntTy::I64,
+                            FloatTy::F32,
+                            SignExtension::Signed,
+                        )))
+                    }
+                    5 => {
+                        num_cvtop!(NumTy::F32, NumTy::I64);
+                        Self::Num(Num::Conversion(CvtOp::TruncSat(
+                            IntTy::I64,
+                            FloatTy::F32,
+                            SignExtension::Unsigned,
+                        )))
+                    }
+                    6 => {
+                        num_cvtop!(NumTy::F64, NumTy::I64);
+                        Self::Num(Num::Conversion(CvtOp::TruncSat(
+                            IntTy::I64,
+                            FloatTy::F64,
+                            SignExtension::Signed,
+                        )))
+                    }
+                    7 => {
+                        num_cvtop!(NumTy::F64, NumTy::I64);
+                        Self::Num(Num::Conversion(CvtOp::TruncSat(
+                            IntTy::I64,
+                            FloatTy::F64,
+                            SignExtension::Unsigned,
+                        )))
+                    }
+
+                    // Memory Instructions
+                    8 => {
+                        let x = DataIndex::decode(reader, ctx)?;
+                        match reader.next()? {
+                            0x00 => {}
+                            _ => return Err(DecodeError::InvalidInstr),
+                        }
+
+                        if !ctx.is_mem_valid(MemIndex(0)) {
+                            // TODO: Need more specific error
+                            return Err(DecodeError::InvalidInstr);
+                        }
+                        validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                        validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                        validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+
+                        Self::Mem(Mem::MemoryInit(x))
+                    }
+                    9 => {
+                        let x = DataIndex::decode(reader, ctx)?;
+                        Self::Mem(Mem::DataDrop(x))
+                    }
+                    10 => {
+                        match reader.next()? {
+                            0x00 => {}
+                            _ => return Err(DecodeError::InvalidInstr),
+                        }
+                        match reader.next()? {
+                            0x00 => {}
+                            _ => return Err(DecodeError::InvalidInstr),
+                        }
+
+                        if !ctx.is_mem_valid(MemIndex(0)) {
+                            // TODO: Need more specific error
+                            return Err(DecodeError::InvalidInstr);
+                        }
+                        validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                        validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                        validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+
+                        Self::Mem(Mem::MemoryCopy)
+                    }
+                    11 => {
+                        match reader.next()? {
+                            0x00 => {}
+                            _ => return Err(DecodeError::InvalidInstr),
+                        }
+
+                        if !ctx.is_mem_valid(MemIndex(0)) {
+                            // TODO: Need more specific error
+                            return Err(DecodeError::InvalidInstr);
+                        }
+                        validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                        validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                        validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+
+                        Self::Mem(Mem::MemoryFill)
+                    }
+
+                    // Table Instructions
+                    12 => {
+                        let y = ElementIndex::decode(reader, ctx)?;
+                        let Some(elem) = ctx.elem(y) else {
+                            return Err(DecodeError::InvalidElementIndex);
+                        };
+
+                        let x = TableIndex::decode(reader, ctx)?;
+                        let Some(table_ty) = ctx.table_ty(x) else {
+                            return Err(DecodeError::InvalidTableIndex);
+                        };
+
+                        if elem.ty != table_ty.elem_ty {
+                            // TODO: Need different error
+                            return Err(DecodeError::InvalidInstr);
+                        }
+
+                        // TODO: Is it better to combine this or to have function take an iterator?
+                        validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                        validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                        validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+
+                        Self::Table(Table::TableInit { elem: y, table: x })
+                    }
+                    13 => {
+                        let x = ElementIndex::decode(reader, ctx)?;
+                        Self::Table(Table::ElemDrop(x))
+                    }
+                    14 => {
+                        let x = TableIndex::decode(reader, ctx)?;
+                        let y = TableIndex::decode(reader, ctx)?;
+
+                        let Some(x_table_ty) = ctx.table_ty(x) else {
+                            return Err(DecodeError::InvalidTableIndex);
+                        };
+                        let Some(y_table_ty) = ctx.table_ty(y) else {
+                            return Err(DecodeError::InvalidTableIndex);
+                        };
+
+                        if x_table_ty.elem_ty != y_table_ty.elem_ty {
+                            // TODO: Need different error
+                            return Err(DecodeError::InvalidInstr);
+                        }
+
+                        // TODO: Is it better to combine this or to have function take an iterator?
+                        validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                        validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                        validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+
+                        Self::Table(Table::TableCopy { x, y })
+                    }
+                    15 => {
+                        let x = TableIndex::decode(reader, ctx)?;
+
+                        validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                        let Some(table_ty) = ctx.table_ty(x) else {
+                            return Err(DecodeError::InvalidTableIndex);
+                        };
+                        validator.pop_expect_val(OpdTy::Ref(table_ty.elem_ty))?;
+                        validator.push_val(OpdTy::Num(NumTy::I32));
+
+                        Self::Table(Table::TableGrow(x))
+                    }
+                    16 => {
+                        let x = TableIndex::decode(reader, ctx)?;
+
+                        validator.push_val(OpdTy::Num(NumTy::I32));
+
+                        Self::Table(Table::TableSize(x))
+                    }
+                    17 => {
+                        let x = TableIndex::decode(reader, ctx)?;
+
+                        validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+                        let Some(table_ty) = ctx.table_ty(x) else {
+                            return Err(DecodeError::InvalidTableIndex);
+                        };
+                        validator.pop_expect_val(OpdTy::Ref(table_ty.elem_ty))?;
+                        validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
+
+                        Self::Table(Table::TableFill(x))
+                    }
+                    _ => return Err(DecodeError::InvalidInstr),
+                },
+                0xfd => {
+                    decode_u32(reader)?;
+                    // TODO: vector instructions
+                    unimplemented!("vector instructions")
                 }
                 _ => return Err(DecodeError::InvalidInstr),
-            },
-            0xfd => {
-                decode_u32(reader)?;
-                // TODO: vector instructions
-                unimplemented!("vector instructions")
-            }
-            _ => return Err(DecodeError::InvalidInstr),
-        })
-    }
+            };
 
-    fn decode_until<R, C>(
-        reader: &mut R,
-        terms: &[u8],
-        ctx: &C,
-        validator: &mut FuncExprValidator,
-    ) -> Result<(Vec<Self>, u8), DecodeError<R::Error>>
-    where
-        R: Read,
-        C: TypesContext
-            + FunctionsContext
-            + TablesContext
-            + MemsContext
-            + GlobalsContext
-            + ElementsContext
-            + DataContext,
-    {
-        debug_assert!(!terms.is_empty());
-
-        let mut instrs = Vec::new();
-        let mut op_code;
-
-        loop {
-            op_code = reader.next()?;
-            if terms.contains(&op_code) {
-                if op_code == OP_CODE_ELSE {
-                    let frame = validator.pop_ctrl()?;
-                    if frame.op_code != 0x04 {
-                        // TODO: Wrong error here
-                        return Err(DecodeError::InvalidExpr(ExprError::UnexpectedTy));
-                    }
-                    validator.push_ctrl(OP_CODE_ELSE, frame.start_tys, frame.end_tys);
-                } else if op_code == OP_CODE_END {
-                    let frame = validator.pop_ctrl()?;
-                    validator.push_vals(&frame.end_tys);
-                }
-                break;
-            }
-
-            let instr = Self::decode_with_op_code(op_code, reader, ctx, validator)?;
             instrs.push(instr);
         }
-
-        Ok((instrs, op_code))
     }
 }
 
@@ -2071,7 +2099,7 @@ impl Expr {
             + ElementsContext
             + DataContext,
     {
-        let (instrs, _) = Instr::decode_until(reader, &[OP_CODE_END], ctx, validator)?;
+        let instrs = Instr::decode(reader, ctx, validator)?;
 
         Ok(Self { instrs })
     }
@@ -2503,6 +2531,7 @@ impl Func {
 
         let mut validator = FuncExprValidator::new(func_ty, &t);
         let e = Expr::decode(reader, ctx, &mut validator)?;
+        debug_assert_eq!(validator.ctrl_frames_len(), 0);
 
         Ok(Self { t, e })
     }
