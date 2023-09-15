@@ -336,16 +336,13 @@ impl MemArg {
     }
 }
 
-const OP_CODE_END: u8 = 0x0b;
-const OP_CODE_ELSE: u8 = 0x05;
-
-impl Instr {
+impl Expr {
     #[allow(clippy::too_many_lines)]
     fn decode<R, C>(
         reader: &mut R,
         ctx: &C,
         validator: &mut FuncExprValidator,
-    ) -> Result<Vec<Self>, DecodeError<R::Error>>
+    ) -> Result<Self, DecodeError<R::Error>>
     where
         R: Read,
         C: TypesContext
@@ -489,9 +486,9 @@ impl Instr {
                 0x00 => {
                     validator.unreachable()?;
 
-                    Self::Control(Control::Unreachable)
+                    Instr::Control(Control::Unreachable)
                 }
-                0x01 => Self::Control(Control::Nop),
+                0x01 => Instr::Control(Control::Nop),
                 0x02 => {
                     let bt = BlockTy::decode(reader, ctx)?;
                     control_op!(bt);
@@ -516,7 +513,8 @@ impl Instr {
                     if frame.op_code != 0x04 {
                         return Err(DecodeError::InvalidInstr);
                     }
-                    validator.push_ctrl(OP_CODE_ELSE, frame.start_tys, frame.end_tys);
+                    // Else
+                    validator.push_ctrl(0x04, frame.start_tys, frame.end_tys);
 
                     let Some(term) = terms.pop() else {
                         return Err(DecodeError::InvalidInstr);
@@ -539,7 +537,7 @@ impl Instr {
 
                     let Some(term) = terms.pop() else {
                         if terms.is_empty() {
-                            return Ok(instrs);
+                            return Ok(Self { instrs });
                         }
 
                         return Err(DecodeError::InvalidInstr);
@@ -547,14 +545,14 @@ impl Instr {
                     match term {
                         RecursiveTerm::BlockEnd(bt, len) => {
                             let block_instrs = instrs.split_off(len);
-                            instrs.push(Self::Control(Control::Block {
+                            instrs.push(Instr::Control(Control::Block {
                                 bt,
                                 instrs: block_instrs,
                             }));
                         }
                         RecursiveTerm::LoopEnd(bt, len) => {
                             let block_instrs = instrs.split_off(len);
-                            instrs.push(Self::Control(Control::Loop {
+                            instrs.push(Instr::Control(Control::Loop {
                                 bt,
                                 instrs: block_instrs,
                             }));
@@ -562,11 +560,11 @@ impl Instr {
                         RecursiveTerm::IfOnlyEnd(bt, then_len, el_len) => {
                             let el = instrs.split_off(el_len);
                             let then = instrs.split_off(then_len);
-                            instrs.push(Self::Control(Control::If { bt, then, el }));
+                            instrs.push(Instr::Control(Control::If { bt, then, el }));
                         }
                         RecursiveTerm::EndElseIf(bt, len) => {
                             let then = instrs.split_off(len);
-                            instrs.push(Self::Control(Control::If {
+                            instrs.push(Instr::Control(Control::If {
                                 bt,
                                 then,
                                 el: Vec::new(),
@@ -592,7 +590,7 @@ impl Instr {
                     validator.pop_expect_vals(&label_tys)?;
                     validator.unreachable()?;
 
-                    Self::Control(Control::Br(l))
+                    Instr::Control(Control::Br(l))
                 }
                 0x0d => {
                     let l = LabelIndex::decode(reader)?;
@@ -612,7 +610,7 @@ impl Instr {
                     validator.pop_expect_vals(&label_tys)?;
                     validator.push_vals(&label_tys);
 
-                    Self::Control(Control::BrIf(l))
+                    Instr::Control(Control::BrIf(l))
                 }
                 0x0e => {
                     let table = decode_vec(reader, LabelIndex::decode)?;
@@ -645,11 +643,11 @@ impl Instr {
                     validator.pop_expect_vals(&opd_tys)?;
                     validator.unreachable()?;
 
-                    Self::Control(Control::BrTable { table, idx })
+                    Instr::Control(Control::BrTable { table, idx })
                 }
                 0x0f => {
                     validator.ret()?;
-                    Self::Control(Control::Return)
+                    Instr::Control(Control::Return)
                 }
                 0x10 => {
                     let idx = FuncIndex::decode(reader, ctx)?;
@@ -678,7 +676,7 @@ impl Instr {
                             .collect::<Vec<_>>(),
                     );
 
-                    Self::Control(Control::Call(idx))
+                    Instr::Control(Control::Call(idx))
                 }
                 0x11 => {
                     let y = TypeIndex::decode(reader, ctx)?;
@@ -713,14 +711,14 @@ impl Instr {
                         .collect::<Vec<_>>();
                     validator.push_vals(&ret);
 
-                    Self::Control(Control::CallIndirect { y, x })
+                    Instr::Control(Control::CallIndirect { y, x })
                 }
 
                 // Reference Instructions
                 0xd0 => {
                     let t = RefTy::decode(reader)?;
                     validator.push_val(OpdTy::Ref(t));
-                    Self::Ref(Ref::RefNull(t))
+                    Instr::Ref(Ref::RefNull(t))
                 }
                 0xd1 => {
                     let t = validator.pop_val()?;
@@ -728,18 +726,18 @@ impl Instr {
                         return Err(DecodeError::InvalidExpr(ExprError::UnexpectedTy));
                     }
                     validator.push_val(OpdTy::Num(NumTy::I32));
-                    Self::Ref(Ref::RefIsNull)
+                    Instr::Ref(Ref::RefIsNull)
                 }
                 0xd2 => {
                     let x = FuncIndex::decode(reader, ctx)?;
                     validator.push_val(OpdTy::Ref(RefTy::FuncRef));
-                    Self::Ref(Ref::RefFunc(x))
+                    Instr::Ref(Ref::RefFunc(x))
                 }
 
                 // Parametric Instructions
                 0x1a => {
                     validator.pop_val()?;
-                    Self::Parametric(Parametric::Drop)
+                    Instr::Parametric(Parametric::Drop)
                 }
                 0x1b => {
                     validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
@@ -755,7 +753,7 @@ impl Instr {
 
                     validator.push_val(t1);
 
-                    Self::Parametric(Parametric::Select(None))
+                    Instr::Parametric(Parametric::Select(None))
                 }
                 0x1c => {
                     let t = decode_vec(reader, ValTy::decode)?;
@@ -768,7 +766,7 @@ impl Instr {
                     validator.pop_expect_vals(&expected)?;
                     validator.push_vals(&expected);
 
-                    Self::Parametric(Parametric::Select(Some(t)))
+                    Instr::Parametric(Parametric::Select(Some(t)))
                 }
 
                 // Variable Instructions
@@ -779,7 +777,7 @@ impl Instr {
                         return Err(DecodeError::InvalidInstr);
                     };
                     validator.push_val(ty);
-                    Self::Var(Variable::LocalGet(x))
+                    Instr::Var(Variable::LocalGet(x))
                 }
                 0x21 => {
                     let x = LocalIndex::decode(reader)?;
@@ -788,7 +786,7 @@ impl Instr {
                         return Err(DecodeError::InvalidInstr);
                     };
                     validator.pop_expect_val(ty)?;
-                    Self::Var(Variable::LocalSet(x))
+                    Instr::Var(Variable::LocalSet(x))
                 }
                 0x22 => {
                     let x = LocalIndex::decode(reader)?;
@@ -798,7 +796,7 @@ impl Instr {
                     };
                     validator.pop_expect_val(ty)?;
                     validator.push_val(ty);
-                    Self::Var(Variable::LocalTee(x))
+                    Instr::Var(Variable::LocalTee(x))
                 }
                 0x23 => {
                     let x = GlobalIndex::decode(reader, ctx)?;
@@ -808,7 +806,7 @@ impl Instr {
                     };
                     validator.push_val(ty.t.into());
 
-                    Self::Var(Variable::GlobalGet(x))
+                    Instr::Var(Variable::GlobalGet(x))
                 }
                 0x24 => {
                     let x = GlobalIndex::decode(reader, ctx)?;
@@ -823,7 +821,7 @@ impl Instr {
                     }
                     validator.pop_expect_val(ty.t.into())?;
 
-                    Self::Var(Variable::GlobalSet(x))
+                    Instr::Var(Variable::GlobalSet(x))
                 }
 
                 // Table Instructions
@@ -836,7 +834,7 @@ impl Instr {
                     };
                     validator.push_val(OpdTy::Ref(ty.elem_ty));
 
-                    Self::Table(Table::TableGet(x))
+                    Instr::Table(Table::TableGet(x))
                 }
                 0x26 => {
                     let x = TableIndex::decode(reader, ctx)?;
@@ -847,34 +845,34 @@ impl Instr {
                     validator.pop_expect_val(OpdTy::Ref(ty.elem_ty))?;
                     validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
 
-                    Self::Table(Table::TableSet(x))
+                    Instr::Table(Table::TableSet(x))
                 }
 
                 // Memory Instructions
                 0x28 => {
                     let m = MemArg::decode(reader)?;
                     mem_load!(NumTy::I32, m.align, 32u32);
-                    Self::Mem(Mem::Load(NumTy::I32, m, None))
+                    Instr::Mem(Mem::Load(NumTy::I32, m, None))
                 }
                 0x29 => {
                     let m = MemArg::decode(reader)?;
                     mem_load!(NumTy::I64, m.align, 64u32);
-                    Self::Mem(Mem::Load(NumTy::I64, m, None))
+                    Instr::Mem(Mem::Load(NumTy::I64, m, None))
                 }
                 0x2a => {
                     let m = MemArg::decode(reader)?;
                     mem_load!(NumTy::F32, m.align, 32u32);
-                    Self::Mem(Mem::Load(NumTy::F32, m, None))
+                    Instr::Mem(Mem::Load(NumTy::F32, m, None))
                 }
                 0x2b => {
                     let m = MemArg::decode(reader)?;
                     mem_load!(NumTy::F64, m.align, 64u32);
-                    Self::Mem(Mem::Load(NumTy::F64, m, None))
+                    Instr::Mem(Mem::Load(NumTy::F64, m, None))
                 }
                 0x2c => {
                     let m = MemArg::decode(reader)?;
                     mem_load!(NumTy::I32, m.align, 8u32);
-                    Self::Mem(Mem::Load(
+                    Instr::Mem(Mem::Load(
                         NumTy::I32,
                         m,
                         Some((StorageSize::Size8, SignExtension::Signed)),
@@ -883,7 +881,7 @@ impl Instr {
                 0x2d => {
                     let m = MemArg::decode(reader)?;
                     mem_load!(NumTy::I32, m.align, 8u32);
-                    Self::Mem(Mem::Load(
+                    Instr::Mem(Mem::Load(
                         NumTy::I32,
                         m,
                         Some((StorageSize::Size8, SignExtension::Unsigned)),
@@ -892,7 +890,7 @@ impl Instr {
                 0x2e => {
                     let m = MemArg::decode(reader)?;
                     mem_load!(NumTy::I32, m.align, 16u32);
-                    Self::Mem(Mem::Load(
+                    Instr::Mem(Mem::Load(
                         NumTy::I32,
                         m,
                         Some((StorageSize::Size16, SignExtension::Signed)),
@@ -901,7 +899,7 @@ impl Instr {
                 0x2f => {
                     let m = MemArg::decode(reader)?;
                     mem_load!(NumTy::I32, m.align, 16u32);
-                    Self::Mem(Mem::Load(
+                    Instr::Mem(Mem::Load(
                         NumTy::I32,
                         m,
                         Some((StorageSize::Size16, SignExtension::Unsigned)),
@@ -910,7 +908,7 @@ impl Instr {
                 0x30 => {
                     let m = MemArg::decode(reader)?;
                     mem_load!(NumTy::I64, m.align, 8u32);
-                    Self::Mem(Mem::Load(
+                    Instr::Mem(Mem::Load(
                         NumTy::I64,
                         m,
                         Some((StorageSize::Size8, SignExtension::Signed)),
@@ -919,7 +917,7 @@ impl Instr {
                 0x31 => {
                     let m = MemArg::decode(reader)?;
                     mem_load!(NumTy::I64, m.align, 8u32);
-                    Self::Mem(Mem::Load(
+                    Instr::Mem(Mem::Load(
                         NumTy::I64,
                         m,
                         Some((StorageSize::Size8, SignExtension::Unsigned)),
@@ -928,7 +926,7 @@ impl Instr {
                 0x32 => {
                     let m = MemArg::decode(reader)?;
                     mem_load!(NumTy::I64, m.align, 16u32);
-                    Self::Mem(Mem::Load(
+                    Instr::Mem(Mem::Load(
                         NumTy::I64,
                         m,
                         Some((StorageSize::Size16, SignExtension::Signed)),
@@ -937,7 +935,7 @@ impl Instr {
                 0x33 => {
                     let m = MemArg::decode(reader)?;
                     mem_load!(NumTy::I64, m.align, 16u32);
-                    Self::Mem(Mem::Load(
+                    Instr::Mem(Mem::Load(
                         NumTy::I64,
                         m,
                         Some((StorageSize::Size16, SignExtension::Unsigned)),
@@ -946,7 +944,7 @@ impl Instr {
                 0x34 => {
                     let m = MemArg::decode(reader)?;
                     mem_load!(NumTy::I64, m.align, 32u32);
-                    Self::Mem(Mem::Load(
+                    Instr::Mem(Mem::Load(
                         NumTy::I64,
                         m,
                         Some((StorageSize::Size32, SignExtension::Signed)),
@@ -955,7 +953,7 @@ impl Instr {
                 0x35 => {
                     let m = MemArg::decode(reader)?;
                     mem_load!(NumTy::I64, m.align, 32u32);
-                    Self::Mem(Mem::Load(
+                    Instr::Mem(Mem::Load(
                         NumTy::I64,
                         m,
                         Some((StorageSize::Size32, SignExtension::Unsigned)),
@@ -964,47 +962,47 @@ impl Instr {
                 0x36 => {
                     let m = MemArg::decode(reader)?;
                     mem_store!(NumTy::I32, m.align, 32u32);
-                    Self::Mem(Mem::Store(NumTy::I32, m, None))
+                    Instr::Mem(Mem::Store(NumTy::I32, m, None))
                 }
                 0x37 => {
                     let m = MemArg::decode(reader)?;
                     mem_store!(NumTy::I64, m.align, 64u32);
-                    Self::Mem(Mem::Store(NumTy::I64, m, None))
+                    Instr::Mem(Mem::Store(NumTy::I64, m, None))
                 }
                 0x38 => {
                     let m = MemArg::decode(reader)?;
                     mem_store!(NumTy::F32, m.align, 32u32);
-                    Self::Mem(Mem::Store(NumTy::F32, m, None))
+                    Instr::Mem(Mem::Store(NumTy::F32, m, None))
                 }
                 0x39 => {
                     let m = MemArg::decode(reader)?;
                     mem_store!(NumTy::F64, m.align, 64u32);
-                    Self::Mem(Mem::Store(NumTy::F64, m, None))
+                    Instr::Mem(Mem::Store(NumTy::F64, m, None))
                 }
                 0x3A => {
                     let m = MemArg::decode(reader)?;
                     mem_store!(NumTy::I32, m.align, 8u32);
-                    Self::Mem(Mem::Store(NumTy::I32, m, Some(StorageSize::Size8)))
+                    Instr::Mem(Mem::Store(NumTy::I32, m, Some(StorageSize::Size8)))
                 }
                 0x3B => {
                     let m = MemArg::decode(reader)?;
                     mem_store!(NumTy::I32, m.align, 16u32);
-                    Self::Mem(Mem::Store(NumTy::I32, m, Some(StorageSize::Size16)))
+                    Instr::Mem(Mem::Store(NumTy::I32, m, Some(StorageSize::Size16)))
                 }
                 0x3C => {
                     let m = MemArg::decode(reader)?;
                     mem_store!(NumTy::I64, m.align, 8u32);
-                    Self::Mem(Mem::Store(NumTy::I64, m, Some(StorageSize::Size8)))
+                    Instr::Mem(Mem::Store(NumTy::I64, m, Some(StorageSize::Size8)))
                 }
                 0x3D => {
                     let m = MemArg::decode(reader)?;
                     mem_store!(NumTy::I64, m.align, 16u32);
-                    Self::Mem(Mem::Store(NumTy::I64, m, Some(StorageSize::Size16)))
+                    Instr::Mem(Mem::Store(NumTy::I64, m, Some(StorageSize::Size16)))
                 }
                 0x3E => {
                     let m = MemArg::decode(reader)?;
                     mem_store!(NumTy::I64, m.align, 32u32);
-                    Self::Mem(Mem::Store(NumTy::I64, m, Some(StorageSize::Size32)))
+                    Instr::Mem(Mem::Store(NumTy::I64, m, Some(StorageSize::Size32)))
                 }
                 0x3F => {
                     match reader.next()? {
@@ -1019,7 +1017,7 @@ impl Instr {
 
                     validator.push_val(OpdTy::Num(NumTy::I32));
 
-                    Self::Mem(Mem::MemorySize)
+                    Instr::Mem(Mem::MemorySize)
                 }
                 0x40 => {
                     match reader.next()? {
@@ -1034,97 +1032,97 @@ impl Instr {
                     validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
                     validator.push_val(OpdTy::Num(NumTy::I32));
 
-                    Self::Mem(Mem::MemoryGrow)
+                    Instr::Mem(Mem::MemoryGrow)
                 }
 
                 // Numeric Instructions
                 0x41 => {
                     let n = decode_s32(reader)?;
                     num_const!(NumTy::I32);
-                    Self::Num(Num::Constant(Const::I32(n)))
+                    Instr::Num(Num::Constant(Const::I32(n)))
                 }
                 0x42 => {
                     let n = decode_s64(reader)?;
                     num_const!(NumTy::I64);
-                    Self::Num(Num::Constant(Const::I64(n)))
+                    Instr::Num(Num::Constant(Const::I64(n)))
                 }
                 0x43 => {
                     let n = decode_f32(reader)?;
                     num_const!(NumTy::F32);
-                    Self::Num(Num::Constant(Const::F32(n)))
+                    Instr::Num(Num::Constant(Const::F32(n)))
                 }
                 0x44 => {
                     let n = decode_f64(reader)?;
                     num_const!(NumTy::F64);
-                    Self::Num(Num::Constant(Const::F64(n)))
+                    Instr::Num(Num::Constant(Const::F64(n)))
                 }
                 // I32 Test Operations
                 0x45 => {
                     num_testop!(NumTy::I32);
-                    Self::Num(Num::Int(IntTy::I32, NumIOp::Test(ITestOp::Eqz)))
+                    Instr::Num(Num::Int(IntTy::I32, NumIOp::Test(ITestOp::Eqz)))
                 }
 
                 // I32 Comparision operations
                 0x46 => {
                     num_relop!(NumTy::I32);
-                    Self::Num(Num::Int(IntTy::I32, NumIOp::Rel(IRelOp::Eq)))
+                    Instr::Num(Num::Int(IntTy::I32, NumIOp::Rel(IRelOp::Eq)))
                 }
                 0x47 => {
                     num_relop!(NumTy::I32);
-                    Self::Num(Num::Int(IntTy::I32, NumIOp::Rel(IRelOp::Ne)))
+                    Instr::Num(Num::Int(IntTy::I32, NumIOp::Rel(IRelOp::Ne)))
                 }
                 0x48 => {
                     num_relop!(NumTy::I32);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I32,
                         NumIOp::Rel(IRelOp::Lt(SignExtension::Signed)),
                     ))
                 }
                 0x49 => {
                     num_relop!(NumTy::I32);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I32,
                         NumIOp::Rel(IRelOp::Lt(SignExtension::Unsigned)),
                     ))
                 }
                 0x4a => {
                     num_relop!(NumTy::I32);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I32,
                         NumIOp::Rel(IRelOp::Gt(SignExtension::Signed)),
                     ))
                 }
                 0x4b => {
                     num_relop!(NumTy::I32);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I32,
                         NumIOp::Rel(IRelOp::Gt(SignExtension::Unsigned)),
                     ))
                 }
                 0x4c => {
                     num_relop!(NumTy::I32);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I32,
                         NumIOp::Rel(IRelOp::Le(SignExtension::Signed)),
                     ))
                 }
                 0x4d => {
                     num_relop!(NumTy::I32);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I32,
                         NumIOp::Rel(IRelOp::Le(SignExtension::Unsigned)),
                     ))
                 }
                 0x4e => {
                     num_relop!(NumTy::I32);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I32,
                         NumIOp::Rel(IRelOp::Ge(SignExtension::Signed)),
                     ))
                 }
                 0x4f => {
                     num_relop!(NumTy::I32);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I32,
                         NumIOp::Rel(IRelOp::Ge(SignExtension::Unsigned)),
                     ))
@@ -1133,70 +1131,70 @@ impl Instr {
                 // I64 Test Operations
                 0x50 => {
                     num_testop!(NumTy::I64);
-                    Self::Num(Num::Int(IntTy::I64, NumIOp::Test(ITestOp::Eqz)))
+                    Instr::Num(Num::Int(IntTy::I64, NumIOp::Test(ITestOp::Eqz)))
                 }
 
                 // I64 Comparision operations
                 0x51 => {
                     num_relop!(NumTy::I64);
-                    Self::Num(Num::Int(IntTy::I64, NumIOp::Rel(IRelOp::Eq)))
+                    Instr::Num(Num::Int(IntTy::I64, NumIOp::Rel(IRelOp::Eq)))
                 }
                 0x52 => {
                     num_relop!(NumTy::I64);
-                    Self::Num(Num::Int(IntTy::I64, NumIOp::Rel(IRelOp::Ne)))
+                    Instr::Num(Num::Int(IntTy::I64, NumIOp::Rel(IRelOp::Ne)))
                 }
                 0x53 => {
                     num_relop!(NumTy::I64);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I64,
                         NumIOp::Rel(IRelOp::Lt(SignExtension::Signed)),
                     ))
                 }
                 0x54 => {
                     num_relop!(NumTy::I64);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I64,
                         NumIOp::Rel(IRelOp::Lt(SignExtension::Unsigned)),
                     ))
                 }
                 0x55 => {
                     num_relop!(NumTy::I64);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I64,
                         NumIOp::Rel(IRelOp::Gt(SignExtension::Signed)),
                     ))
                 }
                 0x56 => {
                     num_relop!(NumTy::I64);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I64,
                         NumIOp::Rel(IRelOp::Gt(SignExtension::Unsigned)),
                     ))
                 }
                 0x57 => {
                     num_relop!(NumTy::I64);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I64,
                         NumIOp::Rel(IRelOp::Le(SignExtension::Signed)),
                     ))
                 }
                 0x58 => {
                     num_relop!(NumTy::I64);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I64,
                         NumIOp::Rel(IRelOp::Le(SignExtension::Unsigned)),
                     ))
                 }
                 0x59 => {
                     num_relop!(NumTy::I64);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I64,
                         NumIOp::Rel(IRelOp::Ge(SignExtension::Signed)),
                     ))
                 }
                 0x5a => {
                     num_relop!(NumTy::I64);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I64,
                         NumIOp::Rel(IRelOp::Ge(SignExtension::Unsigned)),
                     ))
@@ -1205,363 +1203,363 @@ impl Instr {
                 // F32 Comparision operations
                 0x5b => {
                     num_relop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Eq)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Eq)))
                 }
                 0x5c => {
                     num_relop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Ne)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Ne)))
                 }
                 0x5d => {
                     num_relop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Lt)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Lt)))
                 }
                 0x5e => {
                     num_relop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Gt)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Gt)))
                 }
                 0x5f => {
                     num_relop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Le)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Le)))
                 }
                 0x60 => {
                     num_relop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Ge)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Rel(FRelOp::Ge)))
                 }
 
                 // F64 Comparision operations
                 0x61 => {
                     num_relop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Eq)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Eq)))
                 }
                 0x62 => {
                     num_relop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Ne)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Ne)))
                 }
                 0x63 => {
                     num_relop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Lt)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Lt)))
                 }
                 0x64 => {
                     num_relop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Gt)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Gt)))
                 }
                 0x65 => {
                     num_relop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Le)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Le)))
                 }
                 0x66 => {
                     num_relop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Ge)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Rel(FRelOp::Ge)))
                 }
 
                 // I32 remaining operations
                 0x67 => {
                     num_unop!(NumTy::I32);
-                    Self::Num(Num::Int(IntTy::I32, NumIOp::Unary(IUnOp::Clz)))
+                    Instr::Num(Num::Int(IntTy::I32, NumIOp::Unary(IUnOp::Clz)))
                 }
                 0x68 => {
                     num_unop!(NumTy::I32);
-                    Self::Num(Num::Int(IntTy::I32, NumIOp::Unary(IUnOp::Ctz)))
+                    Instr::Num(Num::Int(IntTy::I32, NumIOp::Unary(IUnOp::Ctz)))
                 }
                 0x69 => {
                     num_unop!(NumTy::I32);
-                    Self::Num(Num::Int(IntTy::I32, NumIOp::Unary(IUnOp::PopCnt)))
+                    Instr::Num(Num::Int(IntTy::I32, NumIOp::Unary(IUnOp::PopCnt)))
                 }
                 0x6a => {
                     num_binop!(NumTy::I32);
-                    Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Add)))
+                    Instr::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Add)))
                 }
                 0x6b => {
                     num_binop!(NumTy::I32);
-                    Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Sub)))
+                    Instr::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Sub)))
                 }
                 0x6c => {
                     num_binop!(NumTy::I32);
-                    Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Mul)))
+                    Instr::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Mul)))
                 }
                 0x6d => {
                     num_binop!(NumTy::I32);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I32,
                         NumIOp::Binary(IBinOp::Div(SignExtension::Signed)),
                     ))
                 }
                 0x6e => {
                     num_binop!(NumTy::I32);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I32,
                         NumIOp::Binary(IBinOp::Div(SignExtension::Unsigned)),
                     ))
                 }
                 0x6f => {
                     num_binop!(NumTy::I32);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I32,
                         NumIOp::Binary(IBinOp::Rem(SignExtension::Signed)),
                     ))
                 }
                 0x70 => {
                     num_binop!(NumTy::I32);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I32,
                         NumIOp::Binary(IBinOp::Rem(SignExtension::Unsigned)),
                     ))
                 }
                 0x71 => {
                     num_binop!(NumTy::I32);
-                    Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::And)))
+                    Instr::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::And)))
                 }
                 0x72 => {
                     num_binop!(NumTy::I32);
-                    Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Or)))
+                    Instr::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Or)))
                 }
                 0x73 => {
                     num_binop!(NumTy::I32);
-                    Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Xor)))
+                    Instr::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Xor)))
                 }
                 0x74 => {
                     num_binop!(NumTy::I32);
-                    Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Shl)))
+                    Instr::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Shl)))
                 }
                 0x75 => {
                     num_binop!(NumTy::I32);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I32,
                         NumIOp::Binary(IBinOp::Shr(SignExtension::Signed)),
                     ))
                 }
                 0x76 => {
                     num_binop!(NumTy::I32);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I32,
                         NumIOp::Binary(IBinOp::Shr(SignExtension::Unsigned)),
                     ))
                 }
                 0x77 => {
                     num_binop!(NumTy::I32);
-                    Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Rotl)))
+                    Instr::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Rotl)))
                 }
                 0x78 => {
                     num_binop!(NumTy::I32);
-                    Self::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Rotr)))
+                    Instr::Num(Num::Int(IntTy::I32, NumIOp::Binary(IBinOp::Rotr)))
                 }
 
                 // I64 remaining operations
                 0x79 => {
                     num_unop!(NumTy::I64);
-                    Self::Num(Num::Int(IntTy::I64, NumIOp::Unary(IUnOp::Clz)))
+                    Instr::Num(Num::Int(IntTy::I64, NumIOp::Unary(IUnOp::Clz)))
                 }
                 0x7a => {
                     num_unop!(NumTy::I64);
-                    Self::Num(Num::Int(IntTy::I64, NumIOp::Unary(IUnOp::Ctz)))
+                    Instr::Num(Num::Int(IntTy::I64, NumIOp::Unary(IUnOp::Ctz)))
                 }
                 0x7b => {
                     num_unop!(NumTy::I64);
-                    Self::Num(Num::Int(IntTy::I64, NumIOp::Unary(IUnOp::PopCnt)))
+                    Instr::Num(Num::Int(IntTy::I64, NumIOp::Unary(IUnOp::PopCnt)))
                 }
                 0x7c => {
                     num_binop!(NumTy::I64);
-                    Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Add)))
+                    Instr::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Add)))
                 }
                 0x7d => {
                     num_binop!(NumTy::I64);
-                    Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Sub)))
+                    Instr::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Sub)))
                 }
                 0x7e => {
                     num_binop!(NumTy::I64);
-                    Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Mul)))
+                    Instr::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Mul)))
                 }
                 0x7f => {
                     num_binop!(NumTy::I64);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I64,
                         NumIOp::Binary(IBinOp::Div(SignExtension::Signed)),
                     ))
                 }
                 0x80 => {
                     num_binop!(NumTy::I64);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I64,
                         NumIOp::Binary(IBinOp::Div(SignExtension::Unsigned)),
                     ))
                 }
                 0x81 => {
                     num_binop!(NumTy::I64);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I64,
                         NumIOp::Binary(IBinOp::Rem(SignExtension::Signed)),
                     ))
                 }
                 0x82 => {
                     num_binop!(NumTy::I64);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I64,
                         NumIOp::Binary(IBinOp::Rem(SignExtension::Unsigned)),
                     ))
                 }
                 0x83 => {
                     num_binop!(NumTy::I64);
-                    Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::And)))
+                    Instr::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::And)))
                 }
                 0x84 => {
                     num_binop!(NumTy::I64);
-                    Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Or)))
+                    Instr::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Or)))
                 }
                 0x85 => {
                     num_binop!(NumTy::I64);
-                    Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Xor)))
+                    Instr::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Xor)))
                 }
                 0x86 => {
                     num_binop!(NumTy::I64);
-                    Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Shl)))
+                    Instr::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Shl)))
                 }
                 0x87 => {
                     num_binop!(NumTy::I64);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I64,
                         NumIOp::Binary(IBinOp::Shr(SignExtension::Signed)),
                     ))
                 }
                 0x88 => {
                     num_binop!(NumTy::I64);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I64,
                         NumIOp::Binary(IBinOp::Shr(SignExtension::Unsigned)),
                     ))
                 }
                 0x89 => {
                     num_binop!(NumTy::I64);
-                    Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Rotl)))
+                    Instr::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Rotl)))
                 }
                 0x8a => {
                     num_binop!(NumTy::I64);
-                    Self::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Rotr)))
+                    Instr::Num(Num::Int(IntTy::I64, NumIOp::Binary(IBinOp::Rotr)))
                 }
 
                 // FP32 remaining operations
                 0x8b => {
                     num_unop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Abs)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Abs)))
                 }
                 0x8c => {
                     num_unop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Neg)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Neg)))
                 }
                 0x8d => {
                     num_unop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Ceil)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Ceil)))
                 }
                 0x8e => {
                     num_unop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Floor)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Floor)))
                 }
                 0x8f => {
                     num_unop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Trunc)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Trunc)))
                 }
                 0x90 => {
                     num_unop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Nearest)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Nearest)))
                 }
                 0x91 => {
                     num_unop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Sqrt)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Unary(FUnOp::Sqrt)))
                 }
                 0x92 => {
                     num_binop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Add)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Add)))
                 }
                 0x93 => {
                     num_binop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Sub)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Sub)))
                 }
                 0x94 => {
                     num_binop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Mul)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Mul)))
                 }
                 0x95 => {
                     num_binop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Div)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Div)))
                 }
                 0x96 => {
                     num_binop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Min)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Min)))
                 }
                 0x97 => {
                     num_binop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Max)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::Max)))
                 }
                 0x98 => {
                     num_binop!(NumTy::F32);
-                    Self::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::CopySign)))
+                    Instr::Num(Num::Float(FloatTy::F32, NumFOp::Binary(FBinOp::CopySign)))
                 }
 
                 // FP64 remaining operations
                 0x99 => {
                     num_unop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Abs)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Abs)))
                 }
                 0x9a => {
                     num_unop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Neg)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Neg)))
                 }
                 0x9b => {
                     num_unop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Ceil)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Ceil)))
                 }
                 0x9c => {
                     num_unop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Floor)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Floor)))
                 }
                 0x9d => {
                     num_unop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Trunc)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Trunc)))
                 }
                 0x9e => {
                     num_unop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Nearest)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Nearest)))
                 }
                 0x9f => {
                     num_unop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Sqrt)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Unary(FUnOp::Sqrt)))
                 }
                 0xa0 => {
                     num_binop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Add)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Add)))
                 }
                 0xa1 => {
                     num_binop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Sub)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Sub)))
                 }
                 0xa2 => {
                     num_binop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Mul)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Mul)))
                 }
                 0xa3 => {
                     num_binop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Div)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Div)))
                 }
                 0xa4 => {
                     num_binop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Min)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Min)))
                 }
                 0xa5 => {
                     num_binop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Max)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::Max)))
                 }
                 0xa6 => {
                     num_binop!(NumTy::F64);
-                    Self::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::CopySign)))
+                    Instr::Num(Num::Float(FloatTy::F64, NumFOp::Binary(FBinOp::CopySign)))
                 }
 
                 // Conversion
                 0xa7 => {
                     num_cvtop!(NumTy::I64, NumTy::I32);
-                    Self::Num(Num::Conversion(CvtOp::I32WrapI64))
+                    Instr::Num(Num::Conversion(CvtOp::I32WrapI64))
                 }
                 0xa8 => {
                     num_cvtop!(NumTy::F32, NumTy::I32);
-                    Self::Num(Num::Conversion(CvtOp::Trunc(
+                    Instr::Num(Num::Conversion(CvtOp::Trunc(
                         IntTy::I32,
                         FloatTy::F32,
                         SignExtension::Signed,
@@ -1569,7 +1567,7 @@ impl Instr {
                 }
                 0xa9 => {
                     num_cvtop!(NumTy::F32, NumTy::I32);
-                    Self::Num(Num::Conversion(CvtOp::Trunc(
+                    Instr::Num(Num::Conversion(CvtOp::Trunc(
                         IntTy::I32,
                         FloatTy::F32,
                         SignExtension::Unsigned,
@@ -1577,7 +1575,7 @@ impl Instr {
                 }
                 0xaa => {
                     num_cvtop!(NumTy::F64, NumTy::I32);
-                    Self::Num(Num::Conversion(CvtOp::Trunc(
+                    Instr::Num(Num::Conversion(CvtOp::Trunc(
                         IntTy::I32,
                         FloatTy::F64,
                         SignExtension::Signed,
@@ -1585,7 +1583,7 @@ impl Instr {
                 }
                 0xab => {
                     num_cvtop!(NumTy::F64, NumTy::I32);
-                    Self::Num(Num::Conversion(CvtOp::Trunc(
+                    Instr::Num(Num::Conversion(CvtOp::Trunc(
                         IntTy::I32,
                         FloatTy::F64,
                         SignExtension::Unsigned,
@@ -1593,17 +1591,17 @@ impl Instr {
                 }
                 0xac => {
                     num_cvtop!(NumTy::I32, NumTy::I64);
-                    Self::Num(Num::Conversion(CvtOp::I64ExtendI32(SignExtension::Signed)))
+                    Instr::Num(Num::Conversion(CvtOp::I64ExtendI32(SignExtension::Signed)))
                 }
                 0xad => {
                     num_cvtop!(NumTy::I32, NumTy::I64);
-                    Self::Num(Num::Conversion(CvtOp::I64ExtendI32(
+                    Instr::Num(Num::Conversion(CvtOp::I64ExtendI32(
                         SignExtension::Unsigned,
                     )))
                 }
                 0xae => {
                     num_cvtop!(NumTy::F32, NumTy::I64);
-                    Self::Num(Num::Conversion(CvtOp::Trunc(
+                    Instr::Num(Num::Conversion(CvtOp::Trunc(
                         IntTy::I64,
                         FloatTy::F32,
                         SignExtension::Signed,
@@ -1611,7 +1609,7 @@ impl Instr {
                 }
                 0xaf => {
                     num_cvtop!(NumTy::F32, NumTy::I64);
-                    Self::Num(Num::Conversion(CvtOp::Trunc(
+                    Instr::Num(Num::Conversion(CvtOp::Trunc(
                         IntTy::I64,
                         FloatTy::F32,
                         SignExtension::Unsigned,
@@ -1619,7 +1617,7 @@ impl Instr {
                 }
                 0xb0 => {
                     num_cvtop!(NumTy::F64, NumTy::I64);
-                    Self::Num(Num::Conversion(CvtOp::Trunc(
+                    Instr::Num(Num::Conversion(CvtOp::Trunc(
                         IntTy::I64,
                         FloatTy::F64,
                         SignExtension::Signed,
@@ -1627,7 +1625,7 @@ impl Instr {
                 }
                 0xb1 => {
                     num_cvtop!(NumTy::F64, NumTy::I64);
-                    Self::Num(Num::Conversion(CvtOp::Trunc(
+                    Instr::Num(Num::Conversion(CvtOp::Trunc(
                         IntTy::I64,
                         FloatTy::F64,
                         SignExtension::Unsigned,
@@ -1635,7 +1633,7 @@ impl Instr {
                 }
                 0xb2 => {
                     num_cvtop!(NumTy::I32, NumTy::F32);
-                    Self::Num(Num::Conversion(CvtOp::Convert(
+                    Instr::Num(Num::Conversion(CvtOp::Convert(
                         FloatTy::F32,
                         IntTy::I32,
                         SignExtension::Signed,
@@ -1643,7 +1641,7 @@ impl Instr {
                 }
                 0xb3 => {
                     num_cvtop!(NumTy::I32, NumTy::F32);
-                    Self::Num(Num::Conversion(CvtOp::Convert(
+                    Instr::Num(Num::Conversion(CvtOp::Convert(
                         FloatTy::F32,
                         IntTy::I32,
                         SignExtension::Unsigned,
@@ -1651,7 +1649,7 @@ impl Instr {
                 }
                 0xb4 => {
                     num_cvtop!(NumTy::I64, NumTy::F32);
-                    Self::Num(Num::Conversion(CvtOp::Convert(
+                    Instr::Num(Num::Conversion(CvtOp::Convert(
                         FloatTy::F32,
                         IntTy::I64,
                         SignExtension::Signed,
@@ -1659,7 +1657,7 @@ impl Instr {
                 }
                 0xb5 => {
                     num_cvtop!(NumTy::I64, NumTy::F32);
-                    Self::Num(Num::Conversion(CvtOp::Convert(
+                    Instr::Num(Num::Conversion(CvtOp::Convert(
                         FloatTy::F32,
                         IntTy::I64,
                         SignExtension::Unsigned,
@@ -1667,11 +1665,11 @@ impl Instr {
                 }
                 0xb6 => {
                     num_cvtop!(NumTy::F64, NumTy::F32);
-                    Self::Num(Num::Conversion(CvtOp::F32DemoteF64))
+                    Instr::Num(Num::Conversion(CvtOp::F32DemoteF64))
                 }
                 0xb7 => {
                     num_cvtop!(NumTy::I32, NumTy::F64);
-                    Self::Num(Num::Conversion(CvtOp::Convert(
+                    Instr::Num(Num::Conversion(CvtOp::Convert(
                         FloatTy::F64,
                         IntTy::I32,
                         SignExtension::Signed,
@@ -1679,7 +1677,7 @@ impl Instr {
                 }
                 0xb8 => {
                     num_cvtop!(NumTy::I32, NumTy::F64);
-                    Self::Num(Num::Conversion(CvtOp::Convert(
+                    Instr::Num(Num::Conversion(CvtOp::Convert(
                         FloatTy::F64,
                         IntTy::I32,
                         SignExtension::Unsigned,
@@ -1687,7 +1685,7 @@ impl Instr {
                 }
                 0xb9 => {
                     num_cvtop!(NumTy::I64, NumTy::F64);
-                    Self::Num(Num::Conversion(CvtOp::Convert(
+                    Instr::Num(Num::Conversion(CvtOp::Convert(
                         FloatTy::F64,
                         IntTy::I64,
                         SignExtension::Signed,
@@ -1695,7 +1693,7 @@ impl Instr {
                 }
                 0xba => {
                     num_cvtop!(NumTy::I64, NumTy::F64);
-                    Self::Num(Num::Conversion(CvtOp::Convert(
+                    Instr::Num(Num::Conversion(CvtOp::Convert(
                         FloatTy::F64,
                         IntTy::I64,
                         SignExtension::Unsigned,
@@ -1703,55 +1701,55 @@ impl Instr {
                 }
                 0xbb => {
                     num_cvtop!(NumTy::F32, NumTy::F64);
-                    Self::Num(Num::Conversion(CvtOp::F64PromoteF32))
+                    Instr::Num(Num::Conversion(CvtOp::F64PromoteF32))
                 }
                 0xbc => {
                     num_cvtop!(NumTy::F32, NumTy::I32);
-                    Self::Num(Num::Conversion(CvtOp::I32ReinterpretF32))
+                    Instr::Num(Num::Conversion(CvtOp::I32ReinterpretF32))
                 }
                 0xbd => {
                     num_cvtop!(NumTy::F64, NumTy::I64);
-                    Self::Num(Num::Conversion(CvtOp::I64ReinterpretF64))
+                    Instr::Num(Num::Conversion(CvtOp::I64ReinterpretF64))
                 }
                 0xbe => {
                     num_cvtop!(NumTy::I32, NumTy::F32);
-                    Self::Num(Num::Conversion(CvtOp::F32ReinterpretI32))
+                    Instr::Num(Num::Conversion(CvtOp::F32ReinterpretI32))
                 }
                 0xbf => {
                     num_cvtop!(NumTy::I64, NumTy::F64);
-                    Self::Num(Num::Conversion(CvtOp::F64ReinterpretI64))
+                    Instr::Num(Num::Conversion(CvtOp::F64ReinterpretI64))
                 }
                 0xc0 => {
                     num_unop!(NumTy::I32);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I32,
                         NumIOp::Unary(IUnOp::Extend(StorageSize::Size8)),
                     ))
                 }
                 0xc1 => {
                     num_unop!(NumTy::I32);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I32,
                         NumIOp::Unary(IUnOp::Extend(StorageSize::Size16)),
                     ))
                 }
                 0xc2 => {
                     num_unop!(NumTy::I64);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I64,
                         NumIOp::Unary(IUnOp::Extend(StorageSize::Size8)),
                     ))
                 }
                 0xc3 => {
                     num_unop!(NumTy::I64);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I64,
                         NumIOp::Unary(IUnOp::Extend(StorageSize::Size16)),
                     ))
                 }
                 0xc4 => {
                     num_unop!(NumTy::I64);
-                    Self::Num(Num::Int(
+                    Instr::Num(Num::Int(
                         IntTy::I64,
                         NumIOp::Unary(IUnOp::Extend(StorageSize::Size32)),
                     ))
@@ -1762,7 +1760,7 @@ impl Instr {
                     // Numeric Instructions
                     0 => {
                         num_cvtop!(NumTy::F32, NumTy::I32);
-                        Self::Num(Num::Conversion(CvtOp::TruncSat(
+                        Instr::Num(Num::Conversion(CvtOp::TruncSat(
                             IntTy::I32,
                             FloatTy::F32,
                             SignExtension::Signed,
@@ -1770,7 +1768,7 @@ impl Instr {
                     }
                     1 => {
                         num_cvtop!(NumTy::F32, NumTy::I32);
-                        Self::Num(Num::Conversion(CvtOp::TruncSat(
+                        Instr::Num(Num::Conversion(CvtOp::TruncSat(
                             IntTy::I32,
                             FloatTy::F32,
                             SignExtension::Unsigned,
@@ -1778,7 +1776,7 @@ impl Instr {
                     }
                     2 => {
                         num_cvtop!(NumTy::F64, NumTy::I32);
-                        Self::Num(Num::Conversion(CvtOp::TruncSat(
+                        Instr::Num(Num::Conversion(CvtOp::TruncSat(
                             IntTy::I32,
                             FloatTy::F64,
                             SignExtension::Signed,
@@ -1786,7 +1784,7 @@ impl Instr {
                     }
                     3 => {
                         num_cvtop!(NumTy::F64, NumTy::I32);
-                        Self::Num(Num::Conversion(CvtOp::TruncSat(
+                        Instr::Num(Num::Conversion(CvtOp::TruncSat(
                             IntTy::I32,
                             FloatTy::F64,
                             SignExtension::Unsigned,
@@ -1794,7 +1792,7 @@ impl Instr {
                     }
                     4 => {
                         num_cvtop!(NumTy::F32, NumTy::I64);
-                        Self::Num(Num::Conversion(CvtOp::TruncSat(
+                        Instr::Num(Num::Conversion(CvtOp::TruncSat(
                             IntTy::I64,
                             FloatTy::F32,
                             SignExtension::Signed,
@@ -1802,7 +1800,7 @@ impl Instr {
                     }
                     5 => {
                         num_cvtop!(NumTy::F32, NumTy::I64);
-                        Self::Num(Num::Conversion(CvtOp::TruncSat(
+                        Instr::Num(Num::Conversion(CvtOp::TruncSat(
                             IntTy::I64,
                             FloatTy::F32,
                             SignExtension::Unsigned,
@@ -1810,7 +1808,7 @@ impl Instr {
                     }
                     6 => {
                         num_cvtop!(NumTy::F64, NumTy::I64);
-                        Self::Num(Num::Conversion(CvtOp::TruncSat(
+                        Instr::Num(Num::Conversion(CvtOp::TruncSat(
                             IntTy::I64,
                             FloatTy::F64,
                             SignExtension::Signed,
@@ -1818,7 +1816,7 @@ impl Instr {
                     }
                     7 => {
                         num_cvtop!(NumTy::F64, NumTy::I64);
-                        Self::Num(Num::Conversion(CvtOp::TruncSat(
+                        Instr::Num(Num::Conversion(CvtOp::TruncSat(
                             IntTy::I64,
                             FloatTy::F64,
                             SignExtension::Unsigned,
@@ -1841,11 +1839,11 @@ impl Instr {
                         validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
                         validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
 
-                        Self::Mem(Mem::MemoryInit(x))
+                        Instr::Mem(Mem::MemoryInit(x))
                     }
                     9 => {
                         let x = DataIndex::decode(reader, ctx)?;
-                        Self::Mem(Mem::DataDrop(x))
+                        Instr::Mem(Mem::DataDrop(x))
                     }
                     10 => {
                         match reader.next()? {
@@ -1865,7 +1863,7 @@ impl Instr {
                         validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
                         validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
 
-                        Self::Mem(Mem::MemoryCopy)
+                        Instr::Mem(Mem::MemoryCopy)
                     }
                     11 => {
                         match reader.next()? {
@@ -1881,7 +1879,7 @@ impl Instr {
                         validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
                         validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
 
-                        Self::Mem(Mem::MemoryFill)
+                        Instr::Mem(Mem::MemoryFill)
                     }
 
                     // Table Instructions
@@ -1906,11 +1904,11 @@ impl Instr {
                         validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
                         validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
 
-                        Self::Table(Table::TableInit { elem: y, table: x })
+                        Instr::Table(Table::TableInit { elem: y, table: x })
                     }
                     13 => {
                         let x = ElementIndex::decode(reader, ctx)?;
-                        Self::Table(Table::ElemDrop(x))
+                        Instr::Table(Table::ElemDrop(x))
                     }
                     14 => {
                         let x = TableIndex::decode(reader, ctx)?;
@@ -1933,7 +1931,7 @@ impl Instr {
                         validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
                         validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
 
-                        Self::Table(Table::TableCopy { x, y })
+                        Instr::Table(Table::TableCopy { x, y })
                     }
                     15 => {
                         let x = TableIndex::decode(reader, ctx)?;
@@ -1945,14 +1943,14 @@ impl Instr {
                         validator.pop_expect_val(OpdTy::Ref(table_ty.elem_ty))?;
                         validator.push_val(OpdTy::Num(NumTy::I32));
 
-                        Self::Table(Table::TableGrow(x))
+                        Instr::Table(Table::TableGrow(x))
                     }
                     16 => {
                         let x = TableIndex::decode(reader, ctx)?;
 
                         validator.push_val(OpdTy::Num(NumTy::I32));
 
-                        Self::Table(Table::TableSize(x))
+                        Instr::Table(Table::TableSize(x))
                     }
                     17 => {
                         let x = TableIndex::decode(reader, ctx)?;
@@ -1964,7 +1962,7 @@ impl Instr {
                         validator.pop_expect_val(OpdTy::Ref(table_ty.elem_ty))?;
                         validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
 
-                        Self::Table(Table::TableFill(x))
+                        Instr::Table(Table::TableFill(x))
                     }
                     _ => return Err(DecodeError::InvalidInstr),
                 },
@@ -1981,130 +1979,6 @@ impl Instr {
     }
 }
 
-impl ConstInstr {
-    fn decode_with_op_code<R, C>(
-        op_code: u8,
-        reader: &mut R,
-        ctx: &C,
-        validator: &mut ConstExprValidator,
-    ) -> Result<Self, DecodeError<R::Error>>
-    where
-        R: Read,
-        C: ImportGlobalsContext + FunctionsContext,
-    {
-        use crate::module::instr::Const;
-
-        Ok(match op_code {
-            // Reference Instructions
-            0xd0 => {
-                let t = RefTy::decode(reader)?;
-
-                validator.push_val(OpdTy::Ref(t));
-
-                Self::RefNull(t)
-            }
-            0xd2 => {
-                let x = FuncIndex::decode(reader, ctx)?;
-
-                validator.push_val(OpdTy::Ref(RefTy::FuncRef));
-
-                Self::RefFunc(x)
-            }
-
-            // Variable Instructions
-            0x23 => {
-                let x = ImportGlobalIndex::decode(reader, ctx)?;
-
-                // XXX: This is checking for the import twice since decode above does it.
-                let global_ty = ctx.import_global_ty(x).unwrap();
-                validator.push_val(global_ty.t.into());
-
-                Self::GlobalGet(x)
-            }
-
-            // Numeric Instructions
-            0x41 => {
-                let n = decode_s32(reader)?;
-
-                validator.push_val(OpdTy::Num(NumTy::I32));
-
-                Self::Constant(Const::I32(n))
-            }
-            0x42 => {
-                let n = decode_s64(reader)?;
-
-                validator.push_val(OpdTy::Num(NumTy::I64));
-
-                Self::Constant(Const::I64(n))
-            }
-            0x43 => {
-                let n = decode_f32(reader)?;
-
-                validator.push_val(OpdTy::Num(NumTy::F32));
-
-                Self::Constant(Const::F32(n))
-            }
-            0x44 => {
-                let n = decode_f64(reader)?;
-
-                validator.push_val(OpdTy::Num(NumTy::F64));
-
-                Self::Constant(Const::F64(n))
-            }
-            _ => return Err(DecodeError::InvalidConstInstr),
-        })
-    }
-
-    fn decode_until<R, C>(
-        reader: &mut R,
-        ctx: &C,
-        validator: &mut ConstExprValidator,
-    ) -> Result<Vec<Self>, DecodeError<R::Error>>
-    where
-        R: Read,
-        C: ImportGlobalsContext + FunctionsContext,
-    {
-        let mut instrs = Vec::new();
-        let mut op_code;
-
-        loop {
-            op_code = reader.next()?;
-            if op_code == OP_CODE_END {
-                let frame = validator.pop_ctrl()?;
-                validator.push_vals(&frame.end_tys);
-                break;
-            }
-
-            let instr = Self::decode_with_op_code(op_code, reader, ctx, validator)?;
-            instrs.push(instr);
-        }
-
-        Ok(instrs)
-    }
-}
-
-impl Expr {
-    fn decode<R, C>(
-        reader: &mut R,
-        ctx: &C,
-        validator: &mut FuncExprValidator,
-    ) -> Result<Self, DecodeError<R::Error>>
-    where
-        R: Read,
-        C: TypesContext
-            + FunctionsContext
-            + TablesContext
-            + MemsContext
-            + GlobalsContext
-            + ElementsContext
-            + DataContext,
-    {
-        let instrs = Instr::decode(reader, ctx, validator)?;
-
-        Ok(Self { instrs })
-    }
-}
-
 impl ConstExpr {
     fn decode<R, C>(
         reader: &mut R,
@@ -2115,10 +1989,81 @@ impl ConstExpr {
         R: Read,
         C: ImportGlobalsContext + FunctionsContext,
     {
-        let mut validator = ConstExprValidator::new(expected_ty);
-        let instrs = ConstInstr::decode_until(reader, ctx, &mut validator)?;
+        use crate::module::instr::Const;
 
-        Ok(Self { instrs })
+        let mut validator = ConstExprValidator::new(expected_ty);
+        let mut instrs = Vec::new();
+
+        loop {
+            let op_code = reader.next()?;
+
+            let instr = match op_code {
+                0x0b => {
+                    let frame = validator.pop_ctrl()?;
+                    validator.push_vals(&frame.end_tys);
+                    return Ok(Self { instrs });
+                }
+                // Reference Instructions
+                0xd0 => {
+                    let t = RefTy::decode(reader)?;
+
+                    validator.push_val(OpdTy::Ref(t));
+
+                    ConstInstr::RefNull(t)
+                }
+                0xd2 => {
+                    let x = FuncIndex::decode(reader, ctx)?;
+
+                    validator.push_val(OpdTy::Ref(RefTy::FuncRef));
+
+                    ConstInstr::RefFunc(x)
+                }
+
+                // Variable Instructions
+                0x23 => {
+                    let x = ImportGlobalIndex::decode(reader, ctx)?;
+
+                    // XXX: This is checking for the import twice since decode above does it.
+                    let global_ty = ctx.import_global_ty(x).unwrap();
+                    validator.push_val(global_ty.t.into());
+
+                    ConstInstr::GlobalGet(x)
+                }
+
+                // Numeric Instructions
+                0x41 => {
+                    let n = decode_s32(reader)?;
+
+                    validator.push_val(OpdTy::Num(NumTy::I32));
+
+                    ConstInstr::Constant(Const::I32(n))
+                }
+                0x42 => {
+                    let n = decode_s64(reader)?;
+
+                    validator.push_val(OpdTy::Num(NumTy::I64));
+
+                    ConstInstr::Constant(Const::I64(n))
+                }
+                0x43 => {
+                    let n = decode_f32(reader)?;
+
+                    validator.push_val(OpdTy::Num(NumTy::F32));
+
+                    ConstInstr::Constant(Const::F32(n))
+                }
+                0x44 => {
+                    let n = decode_f64(reader)?;
+
+                    validator.push_val(OpdTy::Num(NumTy::F64));
+
+                    ConstInstr::Constant(Const::F64(n))
+                }
+                _ => return Err(DecodeError::InvalidConstInstr),
+            };
+
+            instrs.push(instr);
+        }
     }
 }
 
