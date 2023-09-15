@@ -6,9 +6,9 @@ use alloc::{fmt, vec, vec::Vec};
 use std::{error, fmt, vec, vec::Vec};
 
 use crate::module::{
-    ty::{self, FuncTy, GlobalTy, MemoryTy, NumTy, RefTy, TableTy, VecTy},
-    DataIndex, Elem, ElementIndex, FuncIndex, Global, GlobalIndex, ImportGlobalIndex, Mem,
-    MemIndex, Table, TableIndex, TypeIndex,
+    ty::{self, FuncTy, GlobalTy, MemoryTy, NumTy, RefTy, TableTy, ValTy, VecTy},
+    DataIndex, Elem, ElementIndex, FuncIndex, Global, GlobalIndex, ImportGlobalIndex, LabelIndex,
+    LocalIndex, Mem, MemIndex, Table, TableIndex, TypeIndex,
 };
 
 /// Value type
@@ -27,8 +27,8 @@ pub(crate) enum OpdTy {
     Unknown,
 }
 
-impl From<ty::ValTy> for OpdTy {
-    fn from(value: ty::ValTy) -> Self {
+impl From<ValTy> for OpdTy {
+    fn from(value: ValTy) -> Self {
         match value {
             ty::ValTy::Num(n) => OpdTy::Num(n),
             ty::ValTy::Vec(v) => OpdTy::Vec(v),
@@ -41,7 +41,7 @@ impl OpdTy {
     /// Return true if the type is a numeric type, false otherwise.
     #[inline]
     #[must_use]
-    fn is_num(self) -> bool {
+    pub(crate) fn is_num(self) -> bool {
         match self {
             OpdTy::Num(_) | OpdTy::Unknown => true,
             OpdTy::Vec(_) | OpdTy::Ref(_) => false,
@@ -51,7 +51,7 @@ impl OpdTy {
     /// Return true if the type is a vector type, false otherwise.
     #[inline]
     #[must_use]
-    fn is_vec(self) -> bool {
+    pub(crate) fn is_vec(self) -> bool {
         match self {
             OpdTy::Vec(_) | OpdTy::Unknown => true,
             OpdTy::Num(_) | OpdTy::Ref(_) => false,
@@ -61,7 +61,7 @@ impl OpdTy {
     /// Return true if the type is a refrence type, false otherwise.
     #[inline]
     #[must_use]
-    fn is_ref(self) -> bool {
+    pub(crate) fn is_ref(self) -> bool {
         match self {
             OpdTy::Ref(_) | OpdTy::Unknown => true,
             OpdTy::Num(_) | OpdTy::Vec(_) => false,
@@ -128,6 +128,12 @@ pub(crate) struct ExprContext {
 }
 
 impl ExprContext {
+    #[inline]
+    #[must_use]
+    fn ctrl_frames_len(&self) -> usize {
+        self.ctrls.len()
+    }
+
     fn push_val(&mut self, ty: OpdTy) {
         self.vals.push(ty);
     }
@@ -205,9 +211,122 @@ impl ExprContext {
         if self.vals.len() < frame.height {
             return Err(ExprError::InvalidStack);
         }
-        self.vals.resize(frame.height, OpdTy::Unknown);
+        self.vals.truncate(frame.height);
         frame.unreachable = true;
         Ok(())
+    }
+
+    fn label_tys(&self, label: LabelIndex) -> &[OpdTy] {
+        // TODO: Potential crash here if label is too much
+        let frame = &self.ctrls[self.ctrls.len() - usize::try_from(label.0).unwrap() - 1];
+        frame.label_tys()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct FuncExprValidator {
+    ctx: ExprContext,
+}
+
+impl FuncExprValidator {
+    #[inline]
+    #[must_use]
+    pub(crate) fn new(func_ty: &FuncTy, locals: &[ValTy]) -> Self {
+        let mut ctx = ExprContext::default();
+        // TODO: Opcode is wrong
+        let mut new_locals = func_ty
+            .rt1
+            .0
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect::<Vec<OpdTy>>();
+        new_locals.extend(locals.iter().copied().map(OpdTy::from));
+        ctx.push_ctrl(
+            0,
+            new_locals,
+            func_ty
+                .rt2
+                .0
+                .iter()
+                .copied()
+                .map(OpdTy::from)
+                .collect::<Vec<_>>(),
+        );
+
+        Self { ctx }
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn ctrl_frames_len(&self) -> usize {
+        self.ctx.ctrl_frames_len()
+    }
+
+    #[inline]
+    pub(crate) fn local_idx(&self, x: LocalIndex) -> Option<OpdTy> {
+        let frame = self.ctx.ctrls.get(0)?;
+        frame.start_tys.get(usize::try_from(x.0).unwrap()).copied()
+    }
+
+    #[inline]
+    pub(crate) fn ret(&mut self) -> Result<(), ExprError> {
+        let Some(frame) = self.ctx.ctrls.get(0) else {
+            panic!();
+        };
+
+        let ret_tys = frame.end_tys.clone();
+
+        self.pop_expect_vals(&ret_tys)?;
+        self.unreachable()?;
+
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn push_val(&mut self, ty: OpdTy) {
+        self.ctx.push_val(ty);
+    }
+
+    #[inline]
+    pub(crate) fn pop_val(&mut self) -> Result<OpdTy, ExprError> {
+        self.ctx.pop_val()
+    }
+
+    #[inline]
+    pub(crate) fn pop_expect_val(&mut self, expect: OpdTy) -> Result<OpdTy, ExprError> {
+        self.ctx.pop_expect_val(expect)
+    }
+
+    #[inline]
+    pub(crate) fn push_vals(&mut self, tys: &[OpdTy]) {
+        self.ctx.push_vals(tys);
+    }
+
+    #[inline]
+    pub(crate) fn pop_expect_vals(&mut self, tys: &[OpdTy]) -> Result<Vec<OpdTy>, ExprError> {
+        self.ctx.pop_expect_vals(tys)
+    }
+
+    #[inline]
+    pub(crate) fn push_ctrl(&mut self, op_code: u8, start_tys: Vec<OpdTy>, end_tys: Vec<OpdTy>) {
+        self.ctx.push_ctrl(op_code, start_tys, end_tys);
+    }
+
+    #[inline]
+    pub(crate) fn pop_ctrl(&mut self) -> Result<CtrlFrame, ExprError> {
+        self.ctx.pop_ctrl()
+    }
+
+    #[inline]
+    pub(crate) fn unreachable(&mut self) -> Result<(), ExprError> {
+        self.ctx.unreachable()
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn label_tys(&self, label: LabelIndex) -> &[OpdTy] {
+        self.ctx.label_tys(label)
     }
 }
 
@@ -226,19 +345,19 @@ impl ConstExprValidator {
         Self { ctx }
     }
 
-    pub(crate) fn end(&mut self) -> Result<(), ExprError> {
-        let frame = self.ctx.pop_ctrl()?;
-        self.ctx.push_vals(&frame.end_tys);
-        Ok(())
-    }
-
-    pub(crate) fn into_final_ty(self) -> Vec<OpdTy> {
-        self.ctx.vals
-    }
-
     #[inline]
     pub(crate) fn push_val(&mut self, ty: OpdTy) {
         self.ctx.push_val(ty);
+    }
+
+    #[inline]
+    pub(crate) fn push_vals(&mut self, tys: &[OpdTy]) {
+        self.ctx.push_vals(tys);
+    }
+
+    #[inline]
+    pub(crate) fn pop_ctrl(&mut self) -> Result<CtrlFrame, ExprError> {
+        self.ctx.pop_ctrl()
     }
 }
 
@@ -277,6 +396,8 @@ macro_rules! impl_import_globals_context {
 }
 
 pub(crate) trait FunctionsContext {
+    fn imported_funcs_len(&self) -> usize;
+
     fn is_func_valid(&self, idx: FuncIndex) -> bool;
 
     fn type_index(&self, idx: FuncIndex) -> Option<TypeIndex>;
@@ -285,6 +406,10 @@ pub(crate) trait FunctionsContext {
 macro_rules! impl_funcs_context {
     ($name:ty) => {
         impl<'a> FunctionsContext for $name {
+            fn imported_funcs_len(&self) -> usize {
+                self.import_funcs.len()
+            }
+
             fn is_func_valid(&self, idx: FuncIndex) -> bool {
                 usize::try_from(idx.0).unwrap() < self.import_funcs.len() + self.type_idxs.len()
             }
@@ -304,6 +429,8 @@ macro_rules! impl_funcs_context {
 
 pub(crate) trait TablesContext {
     fn is_table_valid(&self, idx: TableIndex) -> bool;
+
+    fn table_ty(&self, idx: TableIndex) -> Option<TableTy>;
 }
 
 macro_rules! impl_tables_context {
@@ -311,6 +438,16 @@ macro_rules! impl_tables_context {
         impl<'a> TablesContext for $name {
             fn is_table_valid(&self, idx: TableIndex) -> bool {
                 usize::try_from(idx.0).unwrap() < self.import_tables.len() + self.tables.len()
+            }
+
+            fn table_ty(&self, idx: TableIndex) -> Option<TableTy> {
+                let idx = usize::try_from(idx.0).unwrap();
+                if idx < self.import_tables.len() {
+                    return self.import_tables.get(idx).copied();
+                }
+
+                let idx = idx - self.import_tables.len();
+                self.tables.get(idx).map(|t| t.ty)
             }
         }
     };
@@ -332,6 +469,8 @@ macro_rules! impl_mems_context {
 
 pub(crate) trait GlobalsContext {
     fn is_global_valid(&self, idx: GlobalIndex) -> bool;
+
+    fn global_ty(&self, idx: GlobalIndex) -> Option<&GlobalTy>;
 }
 
 macro_rules! impl_globals_context {
@@ -340,12 +479,25 @@ macro_rules! impl_globals_context {
             fn is_global_valid(&self, idx: GlobalIndex) -> bool {
                 usize::try_from(idx.0).unwrap() < self.import_globals.len() + self.globals.len()
             }
+
+            fn global_ty(&self, idx: GlobalIndex) -> Option<&GlobalTy> {
+                let idx = usize::try_from(idx.0).unwrap();
+                if idx < self.import_globals.len() {
+                    return self.import_globals.get(idx);
+                }
+
+                let idx = idx - self.import_globals.len();
+                let g = self.globals.get(idx)?;
+                Some(&g.ty)
+            }
         }
     };
 }
 
 pub(crate) trait ElementsContext {
     fn is_elem_valid(&self, idx: ElementIndex) -> bool;
+
+    fn elem(&self, idx: ElementIndex) -> Option<&Elem>;
 }
 
 macro_rules! impl_elems_context {
@@ -353,6 +505,12 @@ macro_rules! impl_elems_context {
         impl<'a> ElementsContext for $name {
             fn is_elem_valid(&self, idx: ElementIndex) -> bool {
                 usize::try_from(idx.0).unwrap() < self.elems.len()
+            }
+
+            fn elem(&self, idx: ElementIndex) -> Option<&Elem> {
+                let idx = usize::try_from(idx.0).unwrap();
+                let elem = self.elems.get(idx)?;
+                Some(elem)
             }
         }
     };
@@ -443,10 +601,12 @@ impl_tables_context!(ElementsSectionValidator<'a>);
 pub(crate) struct CodeSectionValidator<'a> {
     pub types: &'a [FuncTy],
     pub import_funcs: &'a [TypeIndex],
+    pub import_mems: &'a [MemoryTy],
     pub import_tables: &'a [TableTy],
     pub import_globals: &'a [GlobalTy],
     pub type_idxs: &'a [TypeIndex],
     pub tables: &'a [Table],
+    pub mems: &'a [Mem],
     pub globals: &'a [Global],
     pub elems: &'a [Elem],
     pub data_len: Option<u32>,
@@ -455,6 +615,7 @@ pub(crate) struct CodeSectionValidator<'a> {
 impl_types_context!(CodeSectionValidator<'a>);
 impl_funcs_context!(CodeSectionValidator<'a>);
 impl_tables_context!(CodeSectionValidator<'a>);
+impl_mems_context!(CodeSectionValidator<'a>);
 impl_globals_context!(CodeSectionValidator<'a>);
 impl_elems_context!(CodeSectionValidator<'a>);
 impl_data_context!(CodeSectionValidator<'a>);
