@@ -132,7 +132,7 @@ pub enum Mut {
     Var,
 }
 
-/// Global type used in a [`Global`].
+/// Global type used in a [`super::Global`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GlobalTy {
     /// Mutablity

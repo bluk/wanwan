@@ -6,9 +6,10 @@ use alloc::{fmt, vec, vec::Vec};
 use std::{error, fmt, vec, vec::Vec};
 
 use crate::module::{
-    ty::{self, FuncTy, GlobalTy, MemoryTy, NumTy, RefTy, TableTy, ValTy, VecTy},
-    DataIndex, Elem, ElementIndex, FuncIndex, Global, GlobalIndex, ImportGlobalIndex, LabelIndex,
-    LocalIndex, Mem, MemIndex, Table, TableIndex, TypeIndex,
+    self,
+    ty::{self, FuncTy, GlobalTy, NumTy, RefTy, TableTy, ValTy, VecTy},
+    DataIndex, Elem, ElementIndex, Elems, FuncIndex, GlobalIndex, Globals, ImportGlobalIndex,
+    Imports, LabelIndex, LocalIndex, MemIndex, Mems, TableIndex, Tables, TypeIndex, Types,
 };
 
 /// Value type
@@ -218,7 +219,7 @@ impl ExprContext {
 
     fn label_tys(&self, label: LabelIndex) -> &[OpdTy] {
         // TODO: Potential crash here if label is too much
-        let frame = &self.ctrls[self.ctrls.len() - usize::try_from(label.0).unwrap() - 1];
+        let frame = &self.ctrls[self.ctrls.len() - usize::try_from(label).unwrap() - 1];
         frame.label_tys()
     }
 }
@@ -266,7 +267,7 @@ impl FuncExprValidator {
     #[inline]
     pub(crate) fn local_idx(&self, x: LocalIndex) -> Option<OpdTy> {
         let frame = self.ctx.ctrls.get(0)?;
-        frame.start_tys.get(usize::try_from(x.0).unwrap()).copied()
+        frame.start_tys.get(usize::try_from(x).unwrap()).copied()
     }
 
     #[inline]
@@ -367,32 +368,8 @@ pub(crate) trait TypesContext {
     fn func_ty(&self, idx: TypeIndex) -> Option<&FuncTy>;
 }
 
-macro_rules! impl_types_context {
-    ($name:ty) => {
-        impl<'a> TypesContext for $name {
-            fn is_type_valid(&self, idx: TypeIndex) -> bool {
-                usize::try_from(idx.0).unwrap() < self.types.len()
-            }
-
-            fn func_ty(&self, idx: TypeIndex) -> Option<&FuncTy> {
-                self.types.get(usize::try_from(idx.0).unwrap())
-            }
-        }
-    };
-}
-
 pub(crate) trait ImportGlobalsContext {
-    fn import_global_ty(&self, idx: ImportGlobalIndex) -> Option<&GlobalTy>;
-}
-
-macro_rules! impl_import_globals_context {
-    ($name:ty) => {
-        impl<'a> ImportGlobalsContext for $name {
-            fn import_global_ty(&self, idx: ImportGlobalIndex) -> Option<&GlobalTy> {
-                self.import_globals.get(usize::try_from(idx.0).unwrap())
-            }
-        }
-    };
+    fn import_global_ty(&self, idx: ImportGlobalIndex) -> Option<GlobalTy>;
 }
 
 pub(crate) trait FunctionsContext {
@@ -403,95 +380,20 @@ pub(crate) trait FunctionsContext {
     fn type_index(&self, idx: FuncIndex) -> Option<TypeIndex>;
 }
 
-macro_rules! impl_funcs_context {
-    ($name:ty) => {
-        impl<'a> FunctionsContext for $name {
-            fn imported_funcs_len(&self) -> usize {
-                self.import_funcs.len()
-            }
-
-            fn is_func_valid(&self, idx: FuncIndex) -> bool {
-                usize::try_from(idx.0).unwrap() < self.import_funcs.len() + self.type_idxs.len()
-            }
-
-            fn type_index(&self, idx: FuncIndex) -> Option<TypeIndex> {
-                let idx = usize::try_from(idx.0).unwrap();
-                if idx < self.import_funcs.len() {
-                    return self.import_funcs.get(idx).copied();
-                }
-
-                let idx = idx - self.import_funcs.len();
-                self.type_idxs.get(idx).copied()
-            }
-        }
-    };
-}
-
 pub(crate) trait TablesContext {
     fn is_table_valid(&self, idx: TableIndex) -> bool;
 
     fn table_ty(&self, idx: TableIndex) -> Option<TableTy>;
 }
 
-macro_rules! impl_tables_context {
-    ($name:ty) => {
-        impl<'a> TablesContext for $name {
-            fn is_table_valid(&self, idx: TableIndex) -> bool {
-                usize::try_from(idx.0).unwrap() < self.import_tables.len() + self.tables.len()
-            }
-
-            fn table_ty(&self, idx: TableIndex) -> Option<TableTy> {
-                let idx = usize::try_from(idx.0).unwrap();
-                if idx < self.import_tables.len() {
-                    return self.import_tables.get(idx).copied();
-                }
-
-                let idx = idx - self.import_tables.len();
-                self.tables.get(idx).map(|t| t.ty)
-            }
-        }
-    };
-}
-
 pub(crate) trait MemsContext {
     fn is_mem_valid(&self, idx: MemIndex) -> bool;
-}
-
-macro_rules! impl_mems_context {
-    ($name:ty) => {
-        impl<'a> MemsContext for $name {
-            fn is_mem_valid(&self, idx: MemIndex) -> bool {
-                usize::try_from(idx.0).unwrap() < self.import_mems.len() + self.mems.len()
-            }
-        }
-    };
 }
 
 pub(crate) trait GlobalsContext {
     fn is_global_valid(&self, idx: GlobalIndex) -> bool;
 
-    fn global_ty(&self, idx: GlobalIndex) -> Option<&GlobalTy>;
-}
-
-macro_rules! impl_globals_context {
-    ($name:ty) => {
-        impl<'a> GlobalsContext for $name {
-            fn is_global_valid(&self, idx: GlobalIndex) -> bool {
-                usize::try_from(idx.0).unwrap() < self.import_globals.len() + self.globals.len()
-            }
-
-            fn global_ty(&self, idx: GlobalIndex) -> Option<&GlobalTy> {
-                let idx = usize::try_from(idx.0).unwrap();
-                if idx < self.import_globals.len() {
-                    return self.import_globals.get(idx);
-                }
-
-                let idx = idx - self.import_globals.len();
-                let g = self.globals.get(idx)?;
-                Some(&g.ty)
-            }
-        }
-    };
+    fn global_ty(&self, idx: GlobalIndex) -> Option<GlobalTy>;
 }
 
 pub(crate) trait ElementsContext {
@@ -500,135 +402,107 @@ pub(crate) trait ElementsContext {
     fn elem(&self, idx: ElementIndex) -> Option<&Elem>;
 }
 
-macro_rules! impl_elems_context {
-    ($name:ty) => {
-        impl<'a> ElementsContext for $name {
-            fn is_elem_valid(&self, idx: ElementIndex) -> bool {
-                usize::try_from(idx.0).unwrap() < self.elems.len()
-            }
-
-            fn elem(&self, idx: ElementIndex) -> Option<&Elem> {
-                let idx = usize::try_from(idx.0).unwrap();
-                let elem = self.elems.get(idx)?;
-                Some(elem)
-            }
-        }
-    };
-}
-
 pub(crate) trait DataContext {
     fn is_data_valid(&self, idx: DataIndex) -> bool;
 }
 
-macro_rules! impl_data_context {
-    ($name:ty) => {
-        impl<'a> DataContext for $name {
-            fn is_data_valid(&self, idx: DataIndex) -> bool {
-                let Some(data_len) = self.data_len else {
-                    return true;
-                };
-                idx.0 < data_len
-            }
-        }
-    };
-}
-
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ImportSectionValidator<'a> {
-    pub types: &'a [FuncTy],
-}
-
-impl_types_context!(ImportSectionValidator<'a>);
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct FunctionSectionValidator<'a> {
-    pub types: &'a [FuncTy],
-}
-
-impl_types_context!(FunctionSectionValidator<'a>);
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct GlobalSectionValidator<'a> {
-    pub import_funcs: &'a [TypeIndex],
-    pub import_globals: &'a [GlobalTy],
+pub(crate) struct Context<'a> {
+    pub types: &'a Types,
+    pub imports: &'a Imports,
     pub type_idxs: &'a [TypeIndex],
-}
-
-impl_import_globals_context!(GlobalSectionValidator<'a>);
-impl_funcs_context!(GlobalSectionValidator<'a>);
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ExportsSectionValidator<'a> {
-    pub import_funcs: &'a [TypeIndex],
-    pub import_tables: &'a [TableTy],
-    pub import_mems: &'a [MemoryTy],
-    pub import_globals: &'a [GlobalTy],
-    pub type_idxs: &'a [TypeIndex],
-    pub tables: &'a [Table],
-    pub mems: &'a [Mem],
-    pub globals: &'a [Global],
-}
-
-impl_funcs_context!(ExportsSectionValidator<'a>);
-impl_tables_context!(ExportsSectionValidator<'a>);
-impl_mems_context!(ExportsSectionValidator<'a>);
-impl_globals_context!(ExportsSectionValidator<'a>);
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct StartSectionValidator<'a> {
-    pub types: &'a [FuncTy],
-    pub import_funcs: &'a [TypeIndex],
-    pub type_idxs: &'a [TypeIndex],
-}
-
-impl_types_context!(StartSectionValidator<'a>);
-impl_funcs_context!(StartSectionValidator<'a>);
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ElementsSectionValidator<'a> {
-    pub import_funcs: &'a [TypeIndex],
-    pub import_tables: &'a [TableTy],
-    pub import_globals: &'a [GlobalTy],
-    pub type_idxs: &'a [TypeIndex],
-    pub tables: &'a [Table],
-}
-
-impl_import_globals_context!(ElementsSectionValidator<'a>);
-impl_funcs_context!(ElementsSectionValidator<'a>);
-impl_tables_context!(ElementsSectionValidator<'a>);
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct CodeSectionValidator<'a> {
-    pub types: &'a [FuncTy],
-    pub import_funcs: &'a [TypeIndex],
-    pub import_mems: &'a [MemoryTy],
-    pub import_tables: &'a [TableTy],
-    pub import_globals: &'a [GlobalTy],
-    pub type_idxs: &'a [TypeIndex],
-    pub tables: &'a [Table],
-    pub mems: &'a [Mem],
-    pub globals: &'a [Global],
-    pub elems: &'a [Elem],
+    pub tables: &'a Tables,
+    pub mems: &'a Mems,
+    pub globals: &'a Globals,
+    pub elems: &'a Elems,
     pub data_len: Option<u32>,
 }
 
-impl_types_context!(CodeSectionValidator<'a>);
-impl_funcs_context!(CodeSectionValidator<'a>);
-impl_tables_context!(CodeSectionValidator<'a>);
-impl_mems_context!(CodeSectionValidator<'a>);
-impl_globals_context!(CodeSectionValidator<'a>);
-impl_elems_context!(CodeSectionValidator<'a>);
-impl_data_context!(CodeSectionValidator<'a>);
+impl<'a> TypesContext for Context<'a> {
+    fn is_type_valid(&self, idx: TypeIndex) -> bool {
+        self.types.is_index_valid(idx)
+    }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DataSectionValidator<'a> {
-    pub import_funcs: &'a [TypeIndex],
-    pub import_mems: &'a [MemoryTy],
-    pub import_globals: &'a [GlobalTy],
-    pub type_idxs: &'a [TypeIndex],
-    pub mems: &'a [Mem],
+    fn func_ty(&self, idx: TypeIndex) -> Option<&FuncTy> {
+        self.types.func_ty(idx)
+    }
 }
 
-impl_import_globals_context!(DataSectionValidator<'a>);
-impl_funcs_context!(DataSectionValidator<'a>);
-impl_mems_context!(DataSectionValidator<'a>);
+impl<'a> ImportGlobalsContext for Context<'a> {
+    fn import_global_ty(&self, idx: ImportGlobalIndex) -> Option<GlobalTy> {
+        self.imports
+            .globals_iter()
+            .nth(usize::try_from(idx).unwrap())
+    }
+}
+
+impl<'a> FunctionsContext for Context<'a> {
+    fn imported_funcs_len(&self) -> usize {
+        self.imports.funcs_iter().count()
+    }
+
+    fn is_func_valid(&self, idx: FuncIndex) -> bool {
+        usize::try_from(idx).unwrap() < self.imports.funcs_iter().count() + self.type_idxs.len()
+    }
+
+    fn type_index(&self, idx: FuncIndex) -> Option<TypeIndex> {
+        let idx = usize::try_from(idx).unwrap();
+        let import_funcs_count = self.imports.funcs_iter().count();
+        if idx < import_funcs_count {
+            return self.imports.funcs_iter().nth(idx);
+        }
+
+        let idx = idx - import_funcs_count;
+        self.type_idxs.get(idx).copied()
+    }
+}
+
+impl<'a> TablesContext for Context<'a> {
+    fn is_table_valid(&self, idx: TableIndex) -> bool {
+        usize::try_from(idx).unwrap()
+            < self.imports.tables_iter().count() + self.tables.as_slice().len()
+    }
+
+    fn table_ty(&self, idx: TableIndex) -> Option<TableTy> {
+        module::table_ty(self.imports, self.tables, idx)
+    }
+}
+
+impl<'a> MemsContext for Context<'a> {
+    fn is_mem_valid(&self, idx: MemIndex) -> bool {
+        usize::try_from(idx).unwrap()
+            < self.imports.mems_iter().count() + self.mems.as_slice().len()
+    }
+}
+
+impl<'a> GlobalsContext for Context<'a> {
+    fn is_global_valid(&self, idx: GlobalIndex) -> bool {
+        usize::try_from(idx).unwrap()
+            < self.imports.globals_iter().count() + self.globals.as_slice().len()
+    }
+
+    fn global_ty(&self, idx: GlobalIndex) -> Option<GlobalTy> {
+        module::global_ty(self.imports, self.globals, idx)
+    }
+}
+
+impl<'a> ElementsContext for Context<'a> {
+    fn is_elem_valid(&self, idx: ElementIndex) -> bool {
+        usize::try_from(idx).unwrap() < self.elems.as_slice().len()
+    }
+
+    fn elem(&self, idx: ElementIndex) -> Option<&Elem> {
+        let idx = usize::try_from(idx).unwrap();
+        let elem = self.elems.as_slice().get(idx)?;
+        Some(elem)
+    }
+}
+
+impl<'a> DataContext for Context<'a> {
+    fn is_data_valid(&self, idx: DataIndex) -> bool {
+        let Some(data_len) = self.data_len else {
+            return true;
+        };
+        u32::from(idx) < data_len
+    }
+}

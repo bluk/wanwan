@@ -25,16 +25,15 @@ use crate::{
         ty::{
             FuncTy, GlobalTy, Limits, MemoryTy, Mut, NumTy, RefTy, ResultTy, TableTy, ValTy, VecTy,
         },
-        Data, DataIndex, DataMode, Elem, ElementIndex, ElementSegmentMode, Export, ExportDesc,
-        FuncIndex, Global, GlobalIndex, Import, ImportDesc, ImportGlobalIndex, LabelIndex,
-        LocalIndex, Mem, MemIndex, Module, Table, TableIndex, TypeIndex,
+        Data, DataIndex, DataMode, Datas, Elem, ElementIndex, ElementSegmentMode, Elems, Export,
+        ExportDesc, Exports, FuncIndex, Funcs, Global, GlobalIndex, Globals, Import, ImportDesc,
+        ImportGlobalIndex, Imports, LabelIndex, LocalIndex, Mem, MemIndex, Mems, Module, StartFunc,
+        Table, TableIndex, Tables, TypeIndex, Types,
     },
     validation::{
-        CodeSectionValidator, ConstExprValidator, DataContext, DataSectionValidator,
-        ElementsContext, ElementsSectionValidator, ExportsSectionValidator, ExprError,
-        FuncExprValidator, FunctionSectionValidator, FunctionsContext, GlobalSectionValidator,
-        GlobalsContext, ImportGlobalsContext, ImportSectionValidator, MemsContext, OpdTy,
-        StartSectionValidator, TablesContext, TypesContext,
+        ConstExprValidator, Context, DataContext, ElementsContext, ExprError, FuncExprValidator,
+        FunctionsContext, GlobalsContext, ImportGlobalsContext, MemsContext, OpdTy, TablesContext,
+        TypesContext,
     },
 };
 
@@ -312,7 +311,7 @@ impl BlockTy {
 
         let ty_idx = decode_s33_block_ty(reader)
             .and_then(|ty_idx| u32::try_from(ty_idx).map_err(|_| DecodeError::InvalidNum))
-            .map(TypeIndex)?;
+            .map(TypeIndex::new)?;
 
         if !ctx.is_type_valid(ty_idx) {
             return Err(DecodeError::InvalidTypeIndex);
@@ -408,7 +407,7 @@ impl Expr {
 
             macro_rules! mem_load {
                 ($t:expr, $align:expr, $bits_len:literal) => {
-                    if !ctx.is_mem_valid(MemIndex(0)) {
+                    if !ctx.is_mem_valid(MemIndex::default()) {
                         // TODO: More specific errror
                         return Err(DecodeError::InvalidInstr);
                     }
@@ -424,7 +423,7 @@ impl Expr {
 
             macro_rules! mem_store {
                 ($t:expr, $align:expr, $bits_len:literal) => {
-                    if !ctx.is_mem_valid(MemIndex(0)) {
+                    if !ctx.is_mem_valid(MemIndex::default()) {
                         // TODO: More specific errror
                         return Err(DecodeError::InvalidInstr);
                     }
@@ -576,7 +575,7 @@ impl Expr {
                 }
                 0x0c => {
                     let l = LabelIndex::decode(reader)?;
-                    if validator.ctrl_frames_len() < usize::try_from(l.0).unwrap() {
+                    if validator.ctrl_frames_len() < usize::try_from(l).unwrap() {
                         // TODO: Check if correct error
                         return Err(DecodeError::InvalidExpr(ExprError::Underflow));
                     }
@@ -595,7 +594,7 @@ impl Expr {
                 0x0d => {
                     let l = LabelIndex::decode(reader)?;
 
-                    if validator.ctrl_frames_len() < usize::try_from(l.0).unwrap() {
+                    if validator.ctrl_frames_len() < usize::try_from(l).unwrap() {
                         // TODO: Check if correct error
                         return Err(DecodeError::InvalidExpr(ExprError::Underflow));
                     }
@@ -617,13 +616,13 @@ impl Expr {
                     let idx = LabelIndex::decode(reader)?;
 
                     validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
-                    if validator.ctrl_frames_len() <= usize::try_from(idx.0).unwrap() {
+                    if validator.ctrl_frames_len() <= usize::try_from(idx).unwrap() {
                         // TODO: Check if correct error
                         return Err(DecodeError::InvalidExpr(ExprError::Underflow));
                     }
                     let arity = validator.label_tys(idx).len();
                     for n in &table {
-                        if validator.ctrl_frames_len() <= usize::try_from(n.0).unwrap() {
+                        if validator.ctrl_frames_len() <= usize::try_from(*n).unwrap() {
                             // TODO: Check if correct error
                             return Err(DecodeError::InvalidExpr(ExprError::Underflow));
                         }
@@ -1010,7 +1009,7 @@ impl Expr {
                         _ => return Err(DecodeError::InvalidInstr),
                     }
 
-                    if !ctx.is_mem_valid(MemIndex(0)) {
+                    if !ctx.is_mem_valid(MemIndex::default()) {
                         // TODO: Need more specific error
                         return Err(DecodeError::InvalidInstr);
                     }
@@ -1025,7 +1024,7 @@ impl Expr {
                         _ => return Err(DecodeError::InvalidInstr),
                     }
 
-                    if !ctx.is_mem_valid(MemIndex(0)) {
+                    if !ctx.is_mem_valid(MemIndex::default()) {
                         // TODO: Need more specific error
                         return Err(DecodeError::InvalidInstr);
                     }
@@ -1831,7 +1830,7 @@ impl Expr {
                             _ => return Err(DecodeError::InvalidInstr),
                         }
 
-                        if !ctx.is_mem_valid(MemIndex(0)) {
+                        if !ctx.is_mem_valid(MemIndex::default()) {
                             // TODO: Need more specific error
                             return Err(DecodeError::InvalidInstr);
                         }
@@ -1855,7 +1854,7 @@ impl Expr {
                             _ => return Err(DecodeError::InvalidInstr),
                         }
 
-                        if !ctx.is_mem_valid(MemIndex(0)) {
+                        if !ctx.is_mem_valid(MemIndex::default()) {
                             // TODO: Need more specific error
                             return Err(DecodeError::InvalidInstr);
                         }
@@ -1871,7 +1870,7 @@ impl Expr {
                             _ => return Err(DecodeError::InvalidInstr),
                         }
 
-                        if !ctx.is_mem_valid(MemIndex(0)) {
+                        if !ctx.is_mem_valid(MemIndex::default()) {
                             // TODO: Need more specific error
                             return Err(DecodeError::InvalidInstr);
                         }
@@ -2073,7 +2072,7 @@ impl TypeIndex {
         R: Read,
         C: TypesContext,
     {
-        let idx = Self(decode_u32(reader)?);
+        let idx = Self::new(decode_u32(reader)?);
         if !ctx.is_type_valid(idx) {
             return Err(DecodeError::InvalidTypeIndex);
         }
@@ -2088,7 +2087,7 @@ impl ImportGlobalIndex {
         R: Read,
         C: ImportGlobalsContext,
     {
-        let idx = Self(decode_u32(reader)?);
+        let idx = Self::new(decode_u32(reader)?);
         let Some(import_ty) = ctx.import_global_ty(idx) else {
             return Err(DecodeError::InvalidGlobalIndex);
         };
@@ -2109,7 +2108,7 @@ impl FuncIndex {
         R: Read,
         C: FunctionsContext,
     {
-        let idx = Self(decode_u32(reader)?);
+        let idx = Self::new(decode_u32(reader)?);
         if !ctx.is_func_valid(idx) {
             return Err(DecodeError::InvalidFuncIndex);
         }
@@ -2124,7 +2123,7 @@ impl TableIndex {
         R: Read,
         C: TablesContext,
     {
-        let idx = Self(decode_u32(reader)?);
+        let idx = Self::new(decode_u32(reader)?);
         if !ctx.is_table_valid(idx) {
             return Err(DecodeError::InvalidTableIndex);
         }
@@ -2139,7 +2138,7 @@ impl MemIndex {
         R: Read,
         C: MemsContext,
     {
-        let idx = Self(decode_u32(reader)?);
+        let idx = Self::new(decode_u32(reader)?);
         if !ctx.is_mem_valid(idx) {
             return Err(DecodeError::InvalidMemIndex);
         }
@@ -2154,7 +2153,7 @@ impl GlobalIndex {
         R: Read,
         C: GlobalsContext,
     {
-        let idx = Self(decode_u32(reader)?);
+        let idx = Self::new(decode_u32(reader)?);
         if !ctx.is_global_valid(idx) {
             return Err(DecodeError::InvalidGlobalIndex);
         }
@@ -2169,7 +2168,7 @@ impl ElementIndex {
         R: Read,
         C: ElementsContext,
     {
-        let idx = Self(decode_u32(reader)?);
+        let idx = Self::new(decode_u32(reader)?);
         if !ctx.is_elem_valid(idx) {
             return Err(DecodeError::InvalidElementIndex);
         }
@@ -2184,7 +2183,7 @@ impl DataIndex {
         R: Read,
         C: DataContext,
     {
-        let idx = Self(decode_u32(reader)?);
+        let idx = Self::new(decode_u32(reader)?);
         if !ctx.is_data_valid(idx) {
             return Err(DecodeError::InvalidDataIndex);
         }
@@ -2200,7 +2199,7 @@ macro_rules! decode_idx {
             where
                 R: Read,
             {
-                Ok(Self(decode_u32(reader)?))
+                Ok(Self::new(decode_u32(reader)?))
             }
         }
     };
@@ -2314,7 +2313,7 @@ impl Elem {
             0 => {
                 let e = ConstExpr::decode(reader, ctx, OpdTy::Num(NumTy::I32))?;
                 let y = decode_vec(reader, |r| FuncIndex::decode(r, ctx))?;
-                let x = TableIndex(0);
+                let x = TableIndex::default();
                 if !ctx.is_table_valid(x) {
                     return Err(DecodeError::InvalidTableIndex);
                 }
@@ -2378,7 +2377,7 @@ impl Elem {
                 let el = decode_vec(reader, |r| {
                     ConstExpr::decode(r, ctx, OpdTy::Ref(RefTy::FuncRef))
                 })?;
-                let x = TableIndex(0);
+                let x = TableIndex::default();
                 if !ctx.is_table_valid(x) {
                     return Err(DecodeError::InvalidTableIndex);
                 }
@@ -2466,7 +2465,7 @@ impl Func {
             t.resize(t.len() + usize::try_from(l.n).unwrap(), l.t);
         }
 
-        let func_idx = FuncIndex(idx + u32::try_from(ctx.imported_funcs_len()).unwrap());
+        let func_idx = FuncIndex::new(idx + u32::try_from(ctx.imported_funcs_len()).unwrap());
         let Some(ty_idx) = ctx.type_index(func_idx) else {
             return Err(DecodeError::InvalidFuncIndex);
         };
@@ -2523,7 +2522,7 @@ impl Data {
             0 => {
                 let e = ConstExpr::decode(reader, ctx, OpdTy::Num(NumTy::I32))?;
                 let b = decode_bytes_vec(reader)?;
-                let x = MemIndex(0);
+                let x = MemIndex::default();
                 if !ctx.is_mem_valid(x) {
                     return Err(DecodeError::InvalidMemIndex);
                 }
@@ -2666,22 +2665,18 @@ impl Module {
 
         let mut last_non_custom_sec_id = None;
 
-        let mut types = Vec::new();
-        let mut imports = Vec::new();
-        let mut import_funcs = Vec::new();
-        let mut import_tables = Vec::new();
-        let mut import_mems = Vec::new();
-        let mut import_globals = Vec::new();
+        let mut types = Types::new();
+        let mut imports = Imports::new();
         let mut type_idxs = Vec::new();
-        let mut tables = Vec::new();
-        let mut mems = Vec::new();
-        let mut globals = Vec::new();
-        let mut exports = Vec::new();
-        let mut start = None;
-        let mut elems = Vec::new();
+        let mut tables = Tables::new();
+        let mut mems = Mems::new();
+        let mut globals = Globals::new();
+        let mut exports = Exports::new();
+        let mut start = StartFunc::new();
+        let mut elems = Elems::new();
         let mut datacount = None;
         let mut code = Vec::new();
-        let mut datas = Vec::new();
+        let mut datas = Datas::new();
 
         loop {
             let sec_id = match reader.next() {
@@ -2696,6 +2691,17 @@ impl Module {
 
             let expected_pos = reader.pos() + u64::from(sec_size);
 
+            let ctx = Context {
+                types: &types,
+                imports: &imports,
+                type_idxs: &type_idxs,
+                tables: &tables,
+                mems: &mems,
+                globals: &globals,
+                elems: &elems,
+                data_len: datacount,
+            };
+
             match sec_id {
                 SectionId::Unknown(_) => return Err(DecodeError::InvalidSection),
                 SectionId::Custom => {
@@ -2703,86 +2709,55 @@ impl Module {
                     continue;
                 }
                 SectionId::Type => {
-                    types = decode_vec(reader, FuncTy::decode)?;
+                    types = Types::with_types(decode_vec(reader, FuncTy::decode)?);
                 }
                 SectionId::Import => {
-                    let ctx = ImportSectionValidator { types: &types };
-                    imports = decode_vec(reader, |r| Import::decode(r, &ctx))?;
-
-                    import_funcs = Vec::new();
-                    import_tables = Vec::new();
-                    import_mems = Vec::new();
-                    import_globals = Vec::new();
-
-                    for i in &imports {
-                        match i.desc {
-                            ImportDesc::Func(ty_idx) => {
-                                import_funcs.push(ty_idx);
-                            }
-                            ImportDesc::Table(tbl) => {
-                                import_tables.push(tbl);
-                            }
-                            ImportDesc::Mem(m) => {
-                                import_mems.push(m);
-                            }
-                            ImportDesc::Global(g) => {
-                                import_globals.push(g);
-                            }
-                        }
-                    }
+                    imports =
+                        Imports::with_imports(decode_vec(reader, |r| Import::decode(r, &ctx))?);
                 }
                 SectionId::Function => {
-                    let ctx = FunctionSectionValidator { types: &types };
                     type_idxs = decode_vec(reader, |r| TypeIndex::decode(r, &ctx))?;
                 }
                 SectionId::Table => {
-                    tables = decode_vec(reader, TableTy::decode)?
-                        .into_iter()
-                        .map(|tt| Table { ty: tt })
-                        .collect();
+                    tables = Tables::with_tables(
+                        decode_vec(reader, TableTy::decode)?
+                            .into_iter()
+                            .map(|tt| Table { ty: tt })
+                            .collect(),
+                    );
                 }
                 SectionId::Memory => {
-                    mems = decode_vec(reader, MemoryTy::decode)?
-                        .into_iter()
-                        .map(|mt| Mem { ty: mt })
-                        .collect();
-                    if mems.len() > 1 {
+                    mems = Mems::with_mems(
+                        decode_vec(reader, MemoryTy::decode)?
+                            .into_iter()
+                            .map(|mt| Mem { ty: mt })
+                            .collect(),
+                    );
+                    if mems.as_slice().len() > 1 {
                         return Err(DecodeError::InvalidMemCount);
                     }
                 }
                 SectionId::Global => {
-                    let ctx = GlobalSectionValidator {
-                        import_funcs: &import_funcs,
-                        import_globals: &import_globals,
-                        type_idxs: &type_idxs,
-                    };
-                    globals = decode_vec(reader, |r| Global::decode(r, &ctx))?;
+                    globals =
+                        Globals::with_globals(decode_vec(reader, |r| Global::decode(r, &ctx))?);
                 }
                 SectionId::Export => {
-                    let ctx = ExportsSectionValidator {
-                        import_funcs: &import_funcs,
-                        import_tables: &import_tables,
-                        import_mems: &import_mems,
-                        import_globals: &import_globals,
-                        type_idxs: &type_idxs,
-                        tables: &tables,
-                        mems: &mems,
-                        globals: &globals,
-                    };
-                    exports = decode_vec(reader, |r| Export::decode(r, &ctx))?;
+                    exports =
+                        Exports::with_exports(decode_vec(reader, |r| Export::decode(r, &ctx))?);
 
-                    for e in &exports {
-                        if exports.iter().filter(|n| n.name == e.name).count() > 1 {
+                    for e in exports.as_slice() {
+                        if exports
+                            .as_slice()
+                            .iter()
+                            .filter(|n| n.name == e.name)
+                            .count()
+                            > 1
+                        {
                             return Err(DecodeError::InvalidSection);
                         }
                     }
                 }
                 SectionId::Start => {
-                    let ctx = StartSectionValidator {
-                        types: &types,
-                        import_funcs: &import_funcs,
-                        type_idxs: &type_idxs,
-                    };
                     let idx = FuncIndex::decode(reader, &ctx)?;
                     let Some(ty_idx) = ctx.type_index(idx) else {
                         return Err(DecodeError::InvalidStart);
@@ -2793,35 +2768,15 @@ impl Module {
                     if !func_ty.is_params_empty() || !func_ty.is_return_empty() {
                         return Err(DecodeError::InvalidStart);
                     }
-                    start = Some(idx);
+                    start = StartFunc::with_start_func(Some(idx));
                 }
                 SectionId::Element => {
-                    let ctx = ElementsSectionValidator {
-                        import_funcs: &import_funcs,
-                        import_tables: &import_tables,
-                        import_globals: &import_globals,
-                        type_idxs: &type_idxs,
-                        tables: &tables,
-                    };
-                    elems = decode_vec(reader, |r| Elem::decode(r, &ctx))?;
+                    elems = Elems::with_elems(decode_vec(reader, |r| Elem::decode(r, &ctx))?);
                 }
                 SectionId::DataCount => {
                     datacount = Some(decode_u32(reader)?);
                 }
                 SectionId::Code => {
-                    let ctx = CodeSectionValidator {
-                        types: &types,
-                        import_funcs: &import_funcs,
-                        import_tables: &import_tables,
-                        import_mems: &import_mems,
-                        import_globals: &import_globals,
-                        type_idxs: &type_idxs,
-                        tables: &tables,
-                        mems: &mems,
-                        globals: &globals,
-                        elems: &elems,
-                        data_len: datacount,
-                    };
                     code = decode_vec_with_index(reader, |idx, r| Code::decode(idx, r, &ctx))?;
 
                     // Early exit possible, but still need to check at the end.
@@ -2831,18 +2786,10 @@ impl Module {
                 }
                 SectionId::Data => {
                     // XXX: If data section exists, then datacount MUST exist in Wasm 2.
-
-                    let ctx = DataSectionValidator {
-                        import_funcs: &import_funcs,
-                        import_mems: &import_mems,
-                        import_globals: &import_globals,
-                        type_idxs: &type_idxs,
-                        mems: &mems,
-                    };
-                    datas = decode_vec(reader, |r| Data::decode(r, &ctx))?;
+                    datas = Datas::with_datas(decode_vec(reader, |r| Data::decode(r, &ctx))?);
                     // XXX: Data count MUST match with the datas size in Wasm 2
                     if let Some(datacount) = datacount {
-                        if datas.len() != usize::try_from(datacount).unwrap() {
+                        if datas.as_slice().len() != usize::try_from(datacount).unwrap() {
                             return Err(DecodeError::InvalidData);
                         }
                     }
@@ -2861,28 +2808,21 @@ impl Module {
             return Err(DecodeError::InvalidModule);
         }
 
-        let funcs = type_idxs
-            .into_iter()
-            .zip(code)
-            .map(|(ty, code)| crate::module::Func {
-                ty,
-                locals: code.code.t,
-                body: code.code.e,
-            })
-            .collect();
+        let funcs = Funcs::with_funcs(
+            type_idxs
+                .into_iter()
+                .zip(code)
+                .map(|(ty, code)| crate::module::Func {
+                    ty,
+                    locals: code.code.t,
+                    body: code.code.e,
+                })
+                .collect(),
+        );
 
-        Ok(Self {
-            types,
-            funcs,
-            tables,
-            mems,
-            globals,
-            elems,
-            datas,
-            start,
-            imports,
-            exports,
-        })
+        Ok(Self::new(
+            types, funcs, tables, mems, globals, elems, datas, start, imports, exports,
+        ))
     }
 }
 
