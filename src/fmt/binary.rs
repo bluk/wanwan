@@ -22,9 +22,7 @@ use std::{
 use crate::{
     module::{
         instr::{BlockTy, ConstExpr, ConstInstr, Expr, Instr, MemArg},
-        ty::{
-            FuncTy, GlobalTy, Limits, MemoryTy, Mut, NumTy, RefTy, ResultTy, TableTy, ValTy, VecTy,
-        },
+        ty::{FuncTy, GlobalTy, Limits, MemTy, Mut, NumTy, RefTy, ResultTy, TableTy, ValTy, VecTy},
         Data, DataIndex, DataMode, Datas, Elem, ElementIndex, ElementSegmentMode, Elems, Export,
         ExportDesc, Exports, FuncIndex, Funcs, Global, GlobalIndex, Globals, Import, ImportDesc,
         ImportGlobalIndex, Imports, LabelIndex, LocalIndex, Mem, MemIndex, Mems, Module, StartFunc,
@@ -235,7 +233,7 @@ impl Limits {
     }
 }
 
-impl MemoryTy {
+impl MemTy {
     fn decode<R>(reader: &mut R) -> Result<Self, DecodeError<R::Error>>
     where
         R: Read,
@@ -2217,7 +2215,7 @@ impl ImportDesc {
         match reader.next()? {
             0x00 => Ok(Self::Func(TypeIndex::decode(reader, ctx)?)),
             0x01 => Ok(Self::Table(TableTy::decode(reader)?)),
-            0x02 => Ok(Self::Mem(MemoryTy::decode(reader)?)),
+            0x02 => Ok(Self::Mem(MemTy::decode(reader)?)),
             0x03 => Ok(Self::Global(GlobalTy::decode(reader)?)),
             _ => Err(DecodeError::InvalidImportDesc),
         }
@@ -2728,7 +2726,7 @@ impl Module {
                 }
                 SectionId::Memory => {
                     mems = Mems::with_mems(
-                        decode_vec(reader, MemoryTy::decode)?
+                        decode_vec(reader, MemTy::decode)?
                             .into_iter()
                             .map(|mt| Mem { ty: mt })
                             .collect(),

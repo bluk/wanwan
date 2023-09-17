@@ -109,7 +109,7 @@ pub struct Limits {
 
 /// Memory type describes the limits of the linear memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MemoryTy {
+pub struct MemTy {
     /// Units are in page size
     pub lim: Limits,
 }
@@ -146,6 +146,6 @@ pub struct GlobalTy {
 pub enum ExternTy {
     Func(FuncTy),
     Table(TableTy),
-    Mem(MemoryTy),
+    Mem(MemTy),
     Global(GlobalTy),
 }

@@ -8,7 +8,7 @@ use std::{string::String, vec::Vec};
 
 use self::{
     instr::{ConstExpr, Expr},
-    ty::{ExternTy, FuncTy, GlobalTy, MemoryTy, RefTy, TableTy, ValTy},
+    ty::{ExternTy, FuncTy, GlobalTy, MemTy, RefTy, TableTy, ValTy},
 };
 
 pub mod instr;
@@ -121,7 +121,7 @@ pub struct Table {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Mem {
-    pub ty: MemoryTy,
+    pub ty: MemTy,
 }
 
 /// Global
@@ -188,7 +188,7 @@ pub enum ImportDesc {
     /// Table type
     Table(TableTy),
     /// Memory type
-    Mem(MemoryTy),
+    Mem(MemTy),
     /// Global type
     Global(GlobalTy),
 }
@@ -444,7 +444,7 @@ impl Imports {
         })
     }
 
-    pub fn mems_iter(&self) -> impl Iterator<Item = MemoryTy> + '_ {
+    pub fn mems_iter(&self) -> impl Iterator<Item = MemTy> + '_ {
         self.0.iter().filter_map(|im| match im.desc {
             ImportDesc::Mem(ty) => Some(ty),
             ImportDesc::Func(_) | ImportDesc::Table(_) | ImportDesc::Global(_) => None,
@@ -507,7 +507,7 @@ pub(crate) fn table_ty(imports: &Imports, tables: &Tables, idx: TableIndex) -> O
 }
 
 #[must_use]
-pub(crate) fn mem_ty(imports: &Imports, mems: &Mems, idx: MemIndex) -> Option<MemoryTy> {
+pub(crate) fn mem_ty(imports: &Imports, mems: &Mems, idx: MemIndex) -> Option<MemTy> {
     let idx = usize::try_from(idx.0).unwrap();
     let import_mems_count = imports.mems_iter().count();
     if idx < import_mems_count {
@@ -621,7 +621,7 @@ impl Module {
     }
 
     #[must_use]
-    pub fn mem_ty(&self, idx: MemIndex) -> Option<MemoryTy> {
+    pub fn mem_ty(&self, idx: MemIndex) -> Option<MemTy> {
         mem_ty(&self.imports, &self.mems, idx)
     }
 

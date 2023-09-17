@@ -14,6 +14,7 @@
 extern crate alloc;
 
 pub mod embed;
+mod exec;
 pub mod fmt;
 pub mod module;
 mod validation;
