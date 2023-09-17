@@ -8,7 +8,7 @@ use std::{string::String, vec::Vec};
 
 use self::{
     instr::{ConstExpr, Expr},
-    ty::{FuncTy, GlobalTy, MemoryTy, RefTy, TableTy, ValTy},
+    ty::{ExternTy, FuncTy, GlobalTy, MemoryTy, RefTy, TableTy, ValTy},
 };
 
 pub mod instr;
@@ -660,9 +660,52 @@ impl Module {
         self.imports.as_slice()
     }
 
+    pub(crate) fn import_external_tys(&self) -> impl Iterator<Item = (&str, &str, ExternTy)> + '_ {
+        self.imports().iter().map(|im| {
+            let ty = match im.desc {
+                ImportDesc::Func(idx) => {
+                    // Index should have been validated
+                    let func_ty = self.func_ty(idx).unwrap();
+                    ExternTy::Func(func_ty.clone())
+                }
+                ImportDesc::Table(t) => ExternTy::Table(t),
+                ImportDesc::Mem(m) => ExternTy::Mem(m),
+                ImportDesc::Global(g) => ExternTy::Global(g),
+            };
+
+            (im.module.as_str(), im.name.as_str(), ty)
+        })
+    }
+
     #[inline]
     #[must_use]
     pub fn exports(&self) -> &[Export] {
         self.exports.as_slice()
+    }
+
+    pub(crate) fn export_external_tys(&self) -> impl Iterator<Item = (&str, ExternTy)> + '_ {
+        self.exports().iter().map(|ex| {
+            let ty = match ex.desc {
+                ExportDesc::Func(idx) => {
+                    // Index should have been validated
+                    let func_ty = self.func_ty(self.type_index(idx).unwrap()).unwrap();
+                    ExternTy::Func(func_ty.clone())
+                }
+                ExportDesc::Table(idx) => {
+                    // Index should have been validated
+                    ExternTy::Table(self.table_ty(idx).unwrap())
+                }
+                ExportDesc::Mem(idx) => {
+                    // Index should have been validated
+                    ExternTy::Mem(self.mem_ty(idx).unwrap())
+                }
+                ExportDesc::Global(idx) => {
+                    // Index should have been validated
+                    ExternTy::Global(self.global_ty(idx).unwrap())
+                }
+            };
+
+            (ex.name.as_str(), ty)
+        })
     }
 }

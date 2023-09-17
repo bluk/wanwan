@@ -140,3 +140,12 @@ pub struct GlobalTy {
     /// Value type
     pub t: ValTy,
 }
+
+/// Type information for an [`super::Import`] or [`super::Export`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternTy {
+    Func(FuncTy),
+    Table(TableTy),
+    Mem(MemoryTy),
+    Global(GlobalTy),
+}

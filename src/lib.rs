@@ -13,6 +13,7 @@
 #[cfg(all(feature = "alloc", not(feature = "std")))]
 extern crate alloc;
 
+pub mod embed;
 pub mod fmt;
 pub mod module;
 mod validation;
