@@ -3051,7 +3051,6 @@ fn decode<R: Read>(mut reader: R) -> Result<Module, Error<R::Error>> {
 /// # Errors
 ///
 /// Returns an error if the data is invalid or if a problem occurs when reading.
-#[cfg(feature = "std")]
 pub fn from_slice(s: &[u8]) -> Result<Module, Error<super::OutOfBoundsError>> {
     decode(super::SliceRead::new(s))
 }
