@@ -17,20 +17,25 @@ use crate::{
     exec::{
         self,
         val::{ExternVal, Ref, Val},
-        FuncAddr, GlobalAddr, HostcodeError, MemAddr, ModuleInst, Store, TableAddr,
+        FuncAddr, GlobalAddr, HostcodeError, MemAddr, Store, TableAddr,
     },
     fmt::binary::{self},
     module::{
         ty::{ExternTy, FuncTy, GlobalTy, MemTy, TableTy},
-        Module,
+        ImportDesc, Module,
     },
 };
+
+#[cfg(feature = "std")]
+use crate::exec::ModuleInst;
 
 #[derive(Debug)]
 enum InnerError {
     Decode(String, u64),
     Exec(exec::Error),
+    InvalidImport,
     UnknownExport,
+    Trap,
 }
 
 impl<E> From<binary::Error<E>> for InnerError
@@ -45,6 +50,12 @@ where
 impl From<exec::Error> for InnerError {
     fn from(value: exec::Error) -> Self {
         Self::Exec(value)
+    }
+}
+
+impl From<exec::Trap> for InnerError {
+    fn from(_: exec::Trap) -> Self {
+        Self::Trap
     }
 }
 
@@ -68,11 +79,21 @@ impl From<exec::Error> for Error {
     }
 }
 
+impl From<exec::Trap> for Error {
+    fn from(_: exec::Trap) -> Self {
+        Self {
+            inner: InnerError::Trap,
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.inner {
             InnerError::Decode(error, _) => f.write_str(error),
             InnerError::Exec(error) => fmt::Display::fmt(error, f),
+            InnerError::InvalidImport => f.write_str("invalid import"),
+            InnerError::Trap => f.write_str("trap"),
             InnerError::UnknownExport => f.write_str("unknown export"),
         }
     }
@@ -82,7 +103,10 @@ impl fmt::Display for Error {
 impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match &self.inner {
-            InnerError::Decode(_, _) | InnerError::UnknownExport => None,
+            InnerError::Decode(_, _)
+            | InnerError::InvalidImport
+            | InnerError::Trap
+            | InnerError::UnknownExport => None,
             InnerError::Exec(error) => Some(error),
         }
     }
@@ -115,6 +139,222 @@ pub fn module_validate(m: Module) -> Result<Module, Error> {
     Ok(m)
 }
 
+/// Instantites a Wasm module.
+///
+/// # Errors
+///
+/// Returns an error if instantiation fails.
+///
+/// # Panics
+///
+/// Panics if the import address values are not valid.
+#[allow(clippy::too_many_lines)]
+#[cfg(feature = "std")]
+#[inline]
+pub fn module_instantiate(
+    mut s: Store,
+    m: Module,
+    imports: &[ExternVal],
+) -> Result<(Store, ModuleInst), Error> {
+    use crate::{
+        exec::{val::Num, ExportInst},
+        module::{DataIndex, DataMode, ElementIndex, ElementSegmentMode, ExportDesc},
+    };
+
+    let m = module_validate(m)?;
+
+    if imports.len() != m.imports().len() {
+        Err(InnerError::InvalidImport)?;
+    }
+
+    let moduleinst_init = ModuleInst::new();
+
+    let mut imported_tables = Vec::new();
+    let mut imported_mems = Vec::new();
+
+    moduleinst_init.write(|mut moduleinst_init| {
+        for (ext, im) in imports.iter().zip(m.imports().iter()) {
+            match ext {
+                ExternVal::Func(f) => {
+                    let ext_ty = s.func_ty(*f).ok_or(InnerError::InvalidImport)?;
+                    match im.desc {
+                        ImportDesc::Func(idx) => {
+                            let im_ty = m.func_ty(idx).ok_or(InnerError::InvalidImport)?;
+                            if ext_ty != im_ty {
+                                Err(InnerError::InvalidImport)?;
+                            }
+
+                            moduleinst_init.push_func(*f);
+                        }
+                        ImportDesc::Table(_) | ImportDesc::Mem(_) | ImportDesc::Global(_) => {
+                            Err(InnerError::InvalidImport)?;
+                        }
+                    }
+                }
+                ExternVal::Table(t) => {
+                    let ext_ty = s.table_ty(*t).ok_or(InnerError::InvalidImport)?;
+                    match im.desc {
+                        ImportDesc::Table(im_ty) => {
+                            if ext_ty != im_ty {
+                                Err(InnerError::InvalidImport)?;
+                            }
+                            imported_tables.push(*t);
+                        }
+                        ImportDesc::Func(_) | ImportDesc::Mem(_) | ImportDesc::Global(_) => {
+                            Err(InnerError::InvalidImport)?;
+                        }
+                    }
+                }
+                ExternVal::Mem(m) => {
+                    let ext_ty = s.mem_ty(*m).ok_or(InnerError::InvalidImport)?;
+                    match im.desc {
+                        ImportDesc::Mem(im_ty) => {
+                            if ext_ty != im_ty {
+                                Err(InnerError::InvalidImport)?;
+                            }
+                            imported_mems.push(*m);
+                        }
+                        ImportDesc::Func(_) | ImportDesc::Table(_) | ImportDesc::Global(_) => {
+                            Err(InnerError::InvalidImport)?;
+                        }
+                    }
+                }
+                ExternVal::Global(g) => {
+                    let ext_ty = s.global_ty(*g).ok_or(InnerError::InvalidImport)?;
+                    match im.desc {
+                        ImportDesc::Global(im_ty) => {
+                            if ext_ty != im_ty {
+                                Err(InnerError::InvalidImport)?;
+                            }
+                            moduleinst_init.push_global(*g);
+                        }
+                        ImportDesc::Func(_) | ImportDesc::Table(_) | ImportDesc::Mem(_) => {
+                            Err(InnerError::InvalidImport)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok::<_, Error>(())
+    })?;
+
+    let module_inst = moduleinst_init;
+    let m2 = module_inst.clone();
+    module_inst.write(|mut module_inst| {
+        for f in m.funcs().iter().cloned() {
+            let ty = m.func_ty(f.ty).unwrap();
+            let addr = s.func_alloc(ty.clone(), m2.clone(), f.clone());
+            module_inst.push_func(addr);
+        }
+
+        for t in m.tables() {
+            let addr = s.table_alloc(t.ty, Ref::Null(t.ty.elem_ty));
+            module_inst.push_table(addr);
+        }
+
+        for m in m.mems() {
+            let addr = s.mem_alloc(m.ty);
+            module_inst.push_mem(addr);
+        }
+
+        for g in m.globals() {
+            let val = g.init.eval(&s, &module_inst);
+            let addr = s.global_alloc(g.ty, val);
+            module_inst.push_global(addr);
+        }
+    });
+
+    for e in m.elems() {
+        let elem = module_inst.read(|module_inst| {
+            e.init
+                .iter()
+                .map(|expr| expr.eval(&s, &module_inst))
+                .map(|val| match val {
+                    Val::Ref(r) => r,
+                    Val::Num(_) | Val::Vec(_) => unreachable!(),
+                })
+                .collect::<Vec<_>>()
+        });
+        let addr = s.elem_alloc(e.ty, elem);
+        module_inst.write(|mut module_inst| {
+            module_inst.push_elem(addr);
+        });
+    }
+
+    module_inst.write(|mut module_inst| {
+        for d in m.datas() {
+            let addr = s.data_alloc(d.init.clone());
+            module_inst.push_data(addr);
+        }
+
+        for e in m.exports() {
+            let value = match &e.desc {
+                ExportDesc::Func(f) => ExternVal::Func(module_inst.func_addr(*f).unwrap()),
+                ExportDesc::Table(t) => ExternVal::Table(module_inst.table_addr(*t).unwrap()),
+                ExportDesc::Mem(m) => ExternVal::Mem(module_inst.mem_addr(*m).unwrap()),
+                ExportDesc::Global(g) => ExternVal::Global(module_inst.global_addr(*g).unwrap()),
+            };
+
+            module_inst.push_export(ExportInst {
+                name: e.name.clone(),
+                value,
+            });
+        }
+    });
+
+    module_inst.read::<Result<_, _>, _>(|module_inst| {
+        for (i, e) in m.elems().iter().enumerate() {
+            let elem_idx = ElementIndex::new(u32::try_from(i).unwrap());
+            match &e.mode {
+                ElementSegmentMode::Active(table_idx, offset) => {
+                    let n = i32::try_from(e.init.len()).unwrap();
+
+                    let offset = offset.eval(&s, &module_inst);
+                    let d = match offset {
+                        Val::Num(num) => match num {
+                            Num::I32(d) => d,
+                            Num::I64(_) | Num::F32(_) | Num::F64(_) => unreachable!(),
+                        },
+                        Val::Vec(_) | Val::Ref(_) => unreachable!(),
+                    };
+
+                    s.table_init(&module_inst, *table_idx, elem_idx, n, 0, d)?;
+                    s.elem_drop(&module_inst, elem_idx);
+                }
+                ElementSegmentMode::Declarative => {
+                    s.elem_drop(&module_inst, elem_idx);
+                }
+                ElementSegmentMode::Passive => {}
+            }
+        }
+
+        for (i, d) in m.datas().iter().enumerate() {
+            let data_idx = DataIndex::new(u32::try_from(i).unwrap());
+            match &d.mode {
+                DataMode::Passive => {}
+                DataMode::Active(mem_idx, offset) => {
+                    assert_eq!(u32::from(*mem_idx), 0);
+                    let n = i32::try_from(d.init.len()).unwrap();
+                    let d = match offset.eval(&s, &module_inst) {
+                        Val::Num(num) => match num {
+                            Num::I32(d) => d,
+                            Num::I64(_) | Num::F32(_) | Num::F64(_) => unreachable!(),
+                        },
+                        Val::Vec(_) | Val::Ref(_) => unreachable!(),
+                    };
+                    s.mem_init(&module_inst, data_idx, n, 0, d)?;
+                    s.data_drop(&module_inst, data_idx);
+                }
+            }
+        }
+
+        Ok::<_, Error>(())
+    })?;
+
+    Ok((s, module_inst))
+}
+
 /// Returns a module's imports.
 #[must_use]
 pub fn module_imports(m: &Module) -> Vec<(String, String, ExternTy)> {
@@ -136,11 +376,14 @@ pub fn module_exports(m: &Module) -> Vec<(String, ExternTy)> {
 /// # Errors
 ///
 /// If there is no export with the given name
+#[cfg(feature = "std")]
 pub fn instance_export(m: &ModuleInst, name: &str) -> Result<ExternVal, Error> {
-    m.exports()
-        .iter()
-        .find_map(|e| (e.name == name).then_some(e.value))
-        .ok_or(Error::from(InnerError::UnknownExport))
+    m.read(|m| {
+        m.exports()
+            .iter()
+            .find_map(|e| (e.name == name).then_some(e.value))
+            .ok_or(Error::from(InnerError::UnknownExport))
+    })
 }
 
 /// Allocate a host function in the store and return the address.

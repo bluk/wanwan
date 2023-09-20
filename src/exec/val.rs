@@ -170,3 +170,27 @@ pub enum ExternVal {
     Mem(MemAddr),
     Global(GlobalAddr),
 }
+
+impl From<FuncAddr> for ExternVal {
+    fn from(value: FuncAddr) -> Self {
+        Self::Func(value)
+    }
+}
+
+impl From<TableAddr> for ExternVal {
+    fn from(value: TableAddr) -> Self {
+        Self::Table(value)
+    }
+}
+
+impl From<MemAddr> for ExternVal {
+    fn from(value: MemAddr) -> Self {
+        Self::Mem(value)
+    }
+}
+
+impl From<GlobalAddr> for ExternVal {
+    fn from(value: GlobalAddr) -> Self {
+        Self::Global(value)
+    }
+}

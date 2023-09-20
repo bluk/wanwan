@@ -19,14 +19,8 @@ macro_rules! impl_index {
         impl $ty {
             #[inline]
             #[must_use]
-            pub const fn new(idx: u32) -> Self {
+            pub(crate) const fn new(idx: u32) -> Self {
                 Self(idx)
-            }
-        }
-
-        impl From<u32> for $ty {
-            fn from(value: u32) -> Self {
-                Self(value)
             }
         }
 
