@@ -1,6 +1,6 @@
 //! Values
 
-use crate::module::ty::RefTy;
+use crate::module::ty::{NumTy, RefTy, ValTy, VecTy};
 
 use super::{ExternAddr, FuncAddr, GlobalAddr, MemAddr, TableAddr};
 
@@ -138,6 +138,27 @@ impl From<FuncAddr> for Val {
 impl From<ExternAddr> for Val {
     fn from(value: ExternAddr) -> Self {
         Self::Ref(Ref::Extern(value))
+    }
+}
+
+impl From<Val> for ValTy {
+    fn from(value: Val) -> Self {
+        match value {
+            Val::Num(n) => match n {
+                Num::I32(_) => ValTy::Num(NumTy::I32),
+                Num::I64(_) => ValTy::Num(NumTy::I64),
+                Num::F32(_) => ValTy::Num(NumTy::F32),
+                Num::F64(_) => ValTy::Num(NumTy::F64),
+            },
+            Val::Vec(v) => match v {
+                Vec::V128(_) => ValTy::Vec(VecTy::V128),
+            },
+            Val::Ref(r) => match r {
+                Ref::Null(r) => ValTy::Ref(r),
+                Ref::Func(_) => ValTy::Ref(RefTy::FuncRef),
+                Ref::Extern(_) => ValTy::Ref(RefTy::ExternRef),
+            },
+        }
     }
 }
 
