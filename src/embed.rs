@@ -30,9 +30,10 @@ use crate::{
 use crate::exec::ModuleInst;
 
 #[derive(Debug)]
-enum InnerError {
+pub(crate) enum InnerError {
     Decode(String, u64),
     Exec(exec::Error),
+    InvalidArguments,
     InvalidImport,
     UnknownExport,
     Trap,
@@ -92,6 +93,7 @@ impl fmt::Display for Error {
         match &self.inner {
             InnerError::Decode(error, _) => f.write_str(error),
             InnerError::Exec(error) => fmt::Display::fmt(error, f),
+            InnerError::InvalidArguments => f.write_str("invalid arguments"),
             InnerError::InvalidImport => f.write_str("invalid import"),
             InnerError::Trap => f.write_str("trap"),
             InnerError::UnknownExport => f.write_str("unknown export"),
@@ -104,6 +106,7 @@ impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match &self.inner {
             InnerError::Decode(_, _)
+            | InnerError::InvalidArguments
             | InnerError::InvalidImport
             | InnerError::Trap
             | InnerError::UnknownExport => None,
@@ -352,6 +355,19 @@ pub fn module_instantiate(
         Ok::<_, Error>(())
     })?;
 
+    let start_func = m.start();
+
+    module_inst.write(|mut module_inst| {
+        module_inst.set_types(m.types.into_inner());
+    });
+
+    if let Some(start_func) = start_func {
+        let start_func_addr = module_inst
+            .read(|module_inst| module_inst.func_addr(start_func))
+            .unwrap();
+        s.eval(start_func_addr, &[])?;
+    }
+
     Ok((s, module_inst))
 }
 
@@ -403,6 +419,21 @@ where
 #[must_use]
 pub fn func_type(s: &Store, a: FuncAddr) -> FuncTy {
     s.func_ty(a).cloned().unwrap()
+}
+
+/// Invokes a function.
+///
+/// # Errors
+///
+/// If the function invocation traps.
+///
+/// # Panics
+///
+/// If the function address is invalid.
+#[cfg(feature = "std")]
+pub fn func_invoke(mut s: Store, a: FuncAddr, values: &[Val]) -> Result<(Store, Vec<Val>), Error> {
+    let result = s.eval(a, values)?;
+    Ok((s, result))
 }
 
 /// Allocate a table in the store and return the address.

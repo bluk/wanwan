@@ -13,10 +13,14 @@ use std::{
     vec::Vec,
 };
 
-use crate::module::{
-    instr::{Const, ConstExpr, ConstInstr},
-    ty::{FuncTy, GlobalTy, MemTy, Mut, RefTy, TableTy},
-    DataIndex, ElementIndex, Func, FuncIndex, GlobalIndex, ImportGlobalIndex, MemIndex, TableIndex,
+use crate::{
+    embed,
+    module::{
+        instr::{self, Const, ConstExpr, ConstInstr, Instr},
+        ty::{FuncTy, GlobalTy, MemTy, Mut, RefTy, TableTy, ValTy},
+        DataIndex, ElementIndex, Func, FuncIndex, GlobalIndex, ImportGlobalIndex, LabelIndex,
+        MemIndex, TableIndex, TypeIndex,
+    },
 };
 
 use self::val::{ExternVal, Ref, Val};
@@ -141,6 +145,16 @@ impl Store {
                 FuncInst::Host { ty, hostcode: _ } => ty,
             })
         }
+    }
+
+    #[must_use]
+    pub(crate) fn func(&self, addr: FuncAddr) -> Option<&FuncInst> {
+        self.funcs.get(addr.0)
+    }
+
+    #[must_use]
+    pub(crate) fn func_mut(&mut self, addr: FuncAddr) -> Option<&mut FuncInst> {
+        self.funcs.get_mut(addr.0)
     }
 
     pub(crate) fn table_alloc(&mut self, ty: TableTy, r: Ref) -> TableAddr {
@@ -392,6 +406,559 @@ impl Store {
         // TODO: "Drop" the element segment from the store
         self.datas[usize::from(addr)].data = Vec::new();
     }
+
+    #[allow(clippy::too_many_lines)]
+    #[cfg(feature = "std")]
+    pub(crate) fn eval(
+        &mut self,
+        addr: FuncAddr,
+        params: &[Val],
+    ) -> Result<Vec<Val>, embed::Error> {
+        use crate::exec::val::Num;
+
+        let mut frames: Vec<Activation> = Vec::new();
+        let mut values: Vec<Val> = Vec::new();
+        let mut labels: Vec<Label> = Vec::new();
+
+        match self.func(addr).unwrap() {
+            FuncInst::Module { ty, module, code } => {
+                if ty.rt1.0.len() != params.len() {
+                    Err(embed::InnerError::InvalidArguments)?;
+                }
+
+                for (expected, actual) in
+                    ty.rt1.0.iter().zip(params.iter().map(|v| ValTy::from(*v)))
+                {
+                    if *expected != actual {
+                        Err(embed::InnerError::InvalidArguments)?;
+                    }
+                }
+
+                let mut locals = Vec::new();
+                locals.extend(params.iter().rev());
+                locals.extend(code.locals.iter().copied().map(ValTy::default_value));
+
+                frames.push(Activation {
+                    values_height: values.len(),
+                    labels_height: labels.len(),
+                    locals,
+                    module: module.clone(),
+                    func_addr: addr,
+                    instr_idx: 0,
+                    arity: ty.rt2.0.len(),
+                });
+
+                labels.push(Label {
+                    values_height: values.len(),
+                    arity: ty.rt2.0.len(),
+                    end_instr_idx: code.body.instrs.len(),
+                    next_instr_idx: None,
+                    br_instr_idx: code.body.instrs.len(),
+                });
+            }
+            FuncInst::Host { ty: _, hostcode: _ } => todo!(),
+        };
+
+        'call: loop {
+            let frame = frames.last().unwrap();
+
+            let instrs = match &self.funcs[usize::from(frame.func_addr)] {
+                FuncInst::Module {
+                    ty: _,
+                    module: _,
+                    code,
+                } => &code.body.instrs,
+                FuncInst::Host { ty: _, hostcode: _ } => unreachable!(),
+            };
+            let mut instr_idx = frame.instr_idx;
+
+            loop {
+                let Some(instr) = instrs.get(instr_idx) else {
+                    break;
+                };
+
+                match instr {
+                    Instr::Control(instr) => match instr {
+                        instr::Control::Unreachable => Err(Trap)?,
+                        instr::Control::Nop => {
+                            // no-op
+                        }
+                        instr::Control::Block { bt, end_idx } => match bt {
+                            instr::BlockTy::Val(ty) => {
+                                labels.push(Label {
+                                    values_height: values.len(),
+                                    arity: ty.is_some().then_some(1).unwrap_or_default(),
+                                    end_instr_idx: *end_idx,
+                                    next_instr_idx: None,
+                                    br_instr_idx: *end_idx,
+                                });
+                            }
+                            instr::BlockTy::Index(ty_idx) => {
+                                let frame = frames.last().unwrap();
+                                frame.module.read(|module_inst| {
+                                    let func_ty = module_inst.func_ty(*ty_idx).unwrap();
+
+                                    let mut params = Vec::new();
+                                    for _ in 0..func_ty.rt1.0.len() {
+                                        params.push(values.pop().unwrap());
+                                    }
+
+                                    if func_ty
+                                        .rt1
+                                        .0
+                                        .iter()
+                                        .zip(params.iter().map(|val| ValTy::from(*val)))
+                                        .any(|(expected, actual)| *expected != actual)
+                                    {
+                                        return Err(Trap);
+                                    }
+
+                                    labels.push(Label {
+                                        values_height: values.len(),
+                                        arity: func_ty.rt2.0.len(),
+                                        end_instr_idx: *end_idx,
+                                        next_instr_idx: None,
+                                        br_instr_idx: *end_idx,
+                                    });
+
+                                    values.extend(params.iter().rev());
+
+                                    Ok(())
+                                })?;
+                            }
+                        },
+                        instr::Control::Loop {
+                            bt,
+                            start_idx,
+                            end_idx,
+                        } => match bt {
+                            instr::BlockTy::Val(_) => {
+                                labels.push(Label {
+                                    values_height: values.len(),
+                                    arity: 0,
+                                    end_instr_idx: *end_idx,
+                                    next_instr_idx: None,
+                                    br_instr_idx: *start_idx,
+                                });
+                            }
+                            instr::BlockTy::Index(ty_idx) => {
+                                let frame = frames.last().unwrap();
+                                frame.module.read(|module_inst| {
+                                    let func_ty = module_inst.func_ty(*ty_idx).unwrap();
+
+                                    let mut params = Vec::new();
+                                    for _ in 0..func_ty.rt1.0.len() {
+                                        params.push(values.pop().unwrap());
+                                    }
+
+                                    if func_ty
+                                        .rt1
+                                        .0
+                                        .iter()
+                                        .zip(params.iter().map(|val| ValTy::from(*val)))
+                                        .any(|(expected, actual)| *expected != actual)
+                                    {
+                                        return Err(Trap);
+                                    }
+
+                                    labels.push(Label {
+                                        values_height: values.len(),
+                                        arity: func_ty.rt1.0.len(),
+                                        end_instr_idx: *end_idx,
+                                        next_instr_idx: None,
+                                        br_instr_idx: *start_idx,
+                                    });
+
+                                    values.extend(params.iter().rev());
+
+                                    Ok(())
+                                })?;
+                            }
+                        },
+                        instr::Control::If {
+                            bt,
+                            then_end_idx,
+                            el_end_idx,
+                        } => {
+                            let Some(Val::Num(Num::I32(c))) = values.pop() else {
+                                unreachable!()
+                            };
+
+                            let c = c != 0;
+                            if !c {
+                                instr_idx = *then_end_idx;
+                            }
+
+                            match bt {
+                                instr::BlockTy::Val(ty) => {
+                                    labels.push(Label {
+                                        values_height: values.len(),
+                                        arity: ty.is_some().then_some(1).unwrap_or_default(),
+                                        end_instr_idx: if c { *then_end_idx } else { *el_end_idx },
+                                        next_instr_idx: Some(*el_end_idx),
+                                        br_instr_idx: *el_end_idx,
+                                    });
+                                }
+                                instr::BlockTy::Index(ty_idx) => {
+                                    let frame = frames.last().unwrap();
+                                    frame.module.read(|module_inst| {
+                                        let func_ty = module_inst.func_ty(*ty_idx).unwrap();
+
+                                        let mut params = Vec::new();
+                                        for _ in 0..func_ty.rt1.0.len() {
+                                            params.push(values.pop().unwrap());
+                                        }
+
+                                        if func_ty
+                                            .rt1
+                                            .0
+                                            .iter()
+                                            .zip(params.iter().map(|val| ValTy::from(*val)))
+                                            .any(|(expected, actual)| *expected != actual)
+                                        {
+                                            return Err(Trap);
+                                        }
+
+                                        labels.push(Label {
+                                            values_height: values.len(),
+                                            arity: func_ty.rt2.0.len(),
+                                            end_instr_idx: if c {
+                                                *then_end_idx
+                                            } else {
+                                                *el_end_idx
+                                            },
+                                            next_instr_idx: None,
+                                            br_instr_idx: *el_end_idx,
+                                        });
+
+                                        values.extend(params.iter().rev());
+
+                                        Ok(())
+                                    })?;
+                                }
+                            }
+                        }
+                        instr::Control::Br(l) => {
+                            branch(*l, &mut labels, &mut values, &mut instr_idx);
+                        }
+                        instr::Control::BrIf(l) => {
+                            let Some(Val::Num(Num::I32(c))) = values.pop() else {
+                                unreachable!()
+                            };
+
+                            if c != 0 {
+                                branch(*l, &mut labels, &mut values, &mut instr_idx);
+                            }
+                        }
+                        instr::Control::BrTable { table, idx } => {
+                            let Some(Val::Num(Num::I32(c))) = values.pop() else {
+                                unreachable!()
+                            };
+                            let c = usize::try_from(c).unwrap();
+                            if c < table.len() {
+                                branch(table[c], &mut labels, &mut values, &mut instr_idx);
+                            } else {
+                                branch(*idx, &mut labels, &mut values, &mut instr_idx);
+                            }
+                        }
+                        instr::Control::Return => {
+                            let frame = frames.last().unwrap();
+                            let n = frame.arity;
+                            let mut params = Vec::new();
+                            for _ in 0..n {
+                                params.push(values.pop().unwrap());
+                            }
+                            while values.len() > frame.values_height {
+                                values.pop();
+                            }
+                            while labels.len() > frame.labels_height {
+                                labels.pop();
+                            }
+                            frames.pop();
+                            values.extend(params.into_iter().rev());
+                            continue 'call;
+                        }
+                        instr::Control::Call(idx) => {
+                            let idx = *idx;
+                            let cur_frame = frames.last_mut().unwrap();
+                            cur_frame.instr_idx = instr_idx + 1;
+
+                            let func_addr = cur_frame
+                                .module
+                                .read(|module_inst| module_inst.func_addr(idx))
+                                .unwrap();
+                            let func = self.func_mut(func_addr).unwrap();
+                            match func {
+                                FuncInst::Module { ty, module, code } => {
+                                    let n = ty.rt1.0.len();
+                                    let mut params = Vec::new();
+                                    for _ in 0..n {
+                                        let Some(val) = values.pop() else {
+                                            unreachable!()
+                                        };
+                                        params.push(val);
+                                    }
+
+                                    for (expected, actual) in
+                                        ty.rt1.0.iter().zip(params.iter().map(|v| ValTy::from(*v)))
+                                    {
+                                        if *expected != actual {
+                                            unreachable!()
+                                        }
+                                    }
+
+                                    let mut locals = Vec::new();
+                                    locals.extend(params.iter().rev());
+                                    locals.extend(
+                                        code.locals.iter().copied().map(ValTy::default_value),
+                                    );
+
+                                    frames.push(Activation {
+                                        values_height: values.len(),
+                                        labels_height: labels.len(),
+                                        locals,
+                                        module: module.clone(),
+                                        func_addr,
+                                        instr_idx: 0,
+                                        arity: ty.rt2.0.len(),
+                                    });
+
+                                    labels.push(Label {
+                                        values_height: values.len(),
+                                        arity: ty.rt2.0.len(),
+                                        end_instr_idx: code.body.instrs.len(),
+                                        next_instr_idx: None,
+                                        br_instr_idx: code.body.instrs.len(),
+                                    });
+                                }
+                                FuncInst::Host { ty, hostcode } => {
+                                    let n = ty.rt1.0.len();
+                                    let mut params = Vec::new();
+                                    for _ in 0..n {
+                                        let Some(val) = values.pop() else {
+                                            unreachable!()
+                                        };
+                                        params.push(val);
+                                    }
+
+                                    match hostcode(&params) {
+                                        Ok(res) => {
+                                            for (expected, actual) in
+                                                ty.rt2.0.iter().zip(res.iter())
+                                            {
+                                                if ValTy::from(*actual) != *expected {
+                                                    return Err(Trap)?;
+                                                }
+                                            }
+
+                                            for r in res {
+                                                values.push(r);
+                                            }
+                                        }
+                                        Err(_) => {
+                                            // TODO: Return the right error
+                                            return Err(Trap)?;
+                                        }
+                                    }
+                                }
+                            }
+                            continue 'call;
+                        }
+                        instr::Control::CallIndirect { y, x } => {
+                            let frame = frames.last().unwrap();
+                            let func_addr = frame.module.read(|module_inst| {
+                                let t_a = module_inst.table_addr(*x).unwrap();
+                                let tab = &self.tables[usize::from(t_a)];
+                                let ft_expect = module_inst.func_ty(*y).unwrap();
+                                let Some(Val::Num(Num::I32(i))) = values.pop() else {
+                                    unreachable!()
+                                };
+                                let i = usize::try_from(i).unwrap();
+                                let Some(r) = tab.elem.get(i) else {
+                                    return Err(Trap);
+                                };
+
+                                let a = match r {
+                                    Ref::Null(_) => {
+                                        return Err(Trap);
+                                    }
+                                    Ref::Extern(_) => {
+                                        unreachable!()
+                                    }
+                                    Ref::Func(a) => a,
+                                };
+                                let f = &self.funcs[usize::from(*a)];
+                                let ft_actual = f.ty();
+                                if ft_actual != ft_expect {
+                                    return Err(Trap);
+                                }
+
+                                Ok(*a)
+                            })?;
+
+                            let func = self.func_mut(func_addr).unwrap();
+                            match func {
+                                FuncInst::Module { ty, module, code } => {
+                                    let n = ty.rt1.0.len();
+                                    let mut params = Vec::new();
+                                    for _ in 0..n {
+                                        let Some(val) = values.pop() else {
+                                            unreachable!()
+                                        };
+                                        params.push(val);
+                                    }
+
+                                    for (expected, actual) in
+                                        ty.rt1.0.iter().zip(params.iter().map(|v| ValTy::from(*v)))
+                                    {
+                                        if *expected != actual {
+                                            unreachable!()
+                                        }
+                                    }
+
+                                    let mut locals = Vec::new();
+                                    locals.extend(params.iter().rev());
+                                    locals.extend(
+                                        code.locals.iter().copied().map(ValTy::default_value),
+                                    );
+
+                                    frames.push(Activation {
+                                        values_height: values.len(),
+                                        labels_height: labels.len(),
+                                        locals,
+                                        module: module.clone(),
+                                        func_addr,
+                                        instr_idx: 0,
+                                        arity: ty.rt2.0.len(),
+                                    });
+
+                                    labels.push(Label {
+                                        values_height: values.len(),
+                                        arity: ty.rt2.0.len(),
+                                        end_instr_idx: code.body.instrs.len(),
+                                        next_instr_idx: None,
+                                        br_instr_idx: code.body.instrs.len(),
+                                    });
+                                }
+                                FuncInst::Host { ty, hostcode } => {
+                                    let n = ty.rt1.0.len();
+                                    let mut params = Vec::new();
+                                    for _ in 0..n {
+                                        let Some(val) = values.pop() else {
+                                            unreachable!()
+                                        };
+                                        params.push(val);
+                                    }
+
+                                    match hostcode(&params) {
+                                        Ok(res) => {
+                                            for (expected, actual) in
+                                                ty.rt2.0.iter().zip(res.iter())
+                                            {
+                                                if ValTy::from(*actual) != *expected {
+                                                    return Err(Trap)?;
+                                                }
+                                            }
+
+                                            for r in res {
+                                                values.push(r);
+                                            }
+                                        }
+                                        Err(_) => {
+                                            // TODO: Return the right error
+                                            return Err(Trap)?;
+                                        }
+                                    }
+                                }
+                            }
+                            continue 'call;
+                        }
+                    },
+                    Instr::Ref(_) => todo!(),
+                    Instr::Parametric(_) => todo!(),
+                    Instr::Var(_) => todo!(),
+                    Instr::Table(_) => todo!(),
+                    Instr::Mem(_) => todo!(),
+                    Instr::Num(instr) => match instr {
+                        instr::Num::Constant(c) => match c {
+                            Const::I32(val) => {
+                                values.push(Val::from(*val));
+                            }
+                            Const::I64(val) => {
+                                values.push(Val::from(*val));
+                            }
+                            Const::F32(val) => {
+                                values.push(Val::from(*val));
+                            }
+                            Const::F64(val) => {
+                                values.push(Val::from(*val));
+                            }
+                        },
+                        instr::Num::Int(_, _) => todo!(),
+                        instr::Num::Float(_, _) => todo!(),
+                        instr::Num::Conversion(_) => todo!(),
+                    },
+                }
+
+                instr_idx += 1;
+
+                let label = labels.last().unwrap();
+                if instr_idx == label.end_instr_idx {
+                    // Pop the label
+                    debug_assert_eq!(values.len(), label.values_height + label.arity);
+                    let last_label = labels.pop().unwrap();
+                    if let Some(idx) = last_label.next_instr_idx {
+                        instr_idx = idx;
+                    }
+                    debug_assert!(!labels.is_empty());
+                }
+            }
+
+            let label = labels.last().unwrap();
+            debug_assert_eq!(instr_idx, label.end_instr_idx);
+            debug_assert_eq!(values.len(), label.values_height + label.arity);
+            let last_label = labels.pop().unwrap();
+            debug_assert_eq!(last_label.next_instr_idx, None);
+
+            let last_frame = frames.last().unwrap();
+            debug_assert_eq!(labels.len(), last_frame.labels_height);
+            debug_assert_eq!(values.len(), last_frame.values_height + last_frame.arity);
+
+            let mut ret = Vec::new();
+            for _ in 0..last_frame.arity {
+                let Some(val) = values.pop() else {
+                    unreachable!()
+                };
+                ret.push(val);
+            }
+
+            if self
+                .func(last_frame.func_addr)
+                .unwrap()
+                .ty()
+                .rt2
+                .0
+                .iter()
+                .zip(ret.iter())
+                .any(|(expected, actual)| *expected != ValTy::from(*actual))
+            {
+                return Err(Trap)?;
+            }
+
+            frames.pop();
+
+            for r in ret {
+                values.push(r);
+            }
+
+            if frames.is_empty() {
+                break;
+            }
+        }
+
+        values.reverse();
+        Ok(values)
+    }
 }
 
 macro_rules! impl_addr {
@@ -441,6 +1008,7 @@ impl_addr!(ExternAddr);
 
 #[derive(Debug)]
 pub(crate) struct ModuleInstInternal {
+    types: Vec<FuncTy>,
     func_addrs: Vec<FuncAddr>,
     table_addrs: Vec<TableAddr>,
     mem_addrs: Vec<MemAddr>,
@@ -455,6 +1023,7 @@ impl ModuleInstInternal {
     #[must_use]
     pub(crate) const fn new() -> Self {
         Self {
+            types: Vec::new(),
             func_addrs: Vec::new(),
             table_addrs: Vec::new(),
             mem_addrs: Vec::new(),
@@ -463,6 +1032,11 @@ impl ModuleInstInternal {
             data_addrs: Vec::new(),
             exports: Vec::new(),
         }
+    }
+
+    #[inline]
+    pub(crate) fn set_types(&mut self, types: Vec<FuncTy>) {
+        self.types = types;
     }
 
     #[inline]
@@ -498,6 +1072,12 @@ impl ModuleInstInternal {
     #[inline]
     pub(crate) fn push_export(&mut self, export: ExportInst) {
         self.exports.push(export);
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn func_ty(&self, idx: TypeIndex) -> Option<&FuncTy> {
+        self.types.get(usize::try_from(idx).unwrap())
     }
 
     #[inline]
@@ -727,4 +1307,57 @@ impl ConstExpr {
             }
         }
     }
+}
+
+#[derive(Debug)]
+struct Label {
+    values_height: usize,
+    arity: usize,
+    /// If the instruction counter reaches this instruction, then pop the label.
+    end_instr_idx: usize,
+    /// The instruction index to jump to once end_instr_idx is reached if not the same index
+    next_instr_idx: Option<usize>,
+    /// If a break occurs, then use this instruction to move to.
+    br_instr_idx: usize,
+}
+
+#[cfg(feature = "std")]
+#[derive(Debug)]
+struct Activation {
+    values_height: usize,
+    labels_height: usize,
+    locals: Vec<Val>,
+    module: ModuleInst,
+    func_addr: FuncAddr,
+    instr_idx: usize,
+    arity: usize,
+}
+
+fn branch(
+    label_idx: LabelIndex,
+    labels: &mut Vec<Label>,
+    values: &mut Vec<Val>,
+    instr_idx: &mut usize,
+) {
+    let mut l = usize::try_from(label_idx).unwrap();
+    debug_assert!(l < labels.len());
+    let n = labels[labels.len() - l - 1].arity;
+    let mut params = Vec::new();
+    for _ in 0..n {
+        params.push(values.pop().unwrap());
+    }
+
+    while l + 1 > 0 {
+        let label = labels.pop().unwrap();
+        debug_assert!(values.len() >= label.values_height);
+        while values.len() > label.values_height {
+            values.pop();
+        }
+
+        l -= 1;
+    }
+
+    values.extend(params.into_iter().rev());
+    let label = labels.last().unwrap();
+    *instr_idx = label.br_instr_idx;
 }

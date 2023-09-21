@@ -239,6 +239,12 @@ impl Types {
     pub fn func_ty(&self, idx: TypeIndex) -> Option<&FuncTy> {
         self.0.get(usize::try_from(idx.0).unwrap())
     }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn into_inner(self) -> Vec<FuncTy> {
+        self.0
+    }
 }
 
 /// Functions defined in a module
@@ -531,7 +537,7 @@ pub(crate) fn global_ty(
 /// Decoded module
 #[derive(Debug)]
 pub struct Module {
-    types: Types,
+    pub(crate) types: Types,
     funcs: Funcs,
     tables: Tables,
     mems: Mems,
