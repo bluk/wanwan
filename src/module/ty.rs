@@ -7,6 +7,8 @@ use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::vec::Vec;
 
+use crate::exec::val::{self, Num, Ref, Val};
+
 /// Number type
 ///
 /// Used to represent function parameter types and return types, local and
@@ -23,6 +25,17 @@ pub enum NumTy {
     F64,
 }
 
+impl NumTy {
+    pub(crate) const fn default_value(self) -> Num {
+        match self {
+            NumTy::I32 => Num::I32(0),
+            NumTy::I64 => Num::I64(0),
+            NumTy::F32 => Num::F32(0.0),
+            NumTy::F64 => Num::F64(0.0),
+        }
+    }
+}
+
 /// Vector type
 ///
 /// Used to represent function parameter types and return types, local and
@@ -31,6 +44,14 @@ pub enum NumTy {
 pub enum VecTy {
     /// 128-bit vector of packed data
     V128,
+}
+
+impl VecTy {
+    pub(crate) const fn default_value(self) -> val::Vec {
+        match self {
+            VecTy::V128 => val::Vec::V128(0),
+        }
+    }
 }
 
 /// Reference type
@@ -48,6 +69,12 @@ pub enum RefTy {
     ExternRef,
 }
 
+impl RefTy {
+    pub(crate) const fn default_value(self) -> Ref {
+        Ref::Null(self)
+    }
+}
+
 /// Value type
 ///
 /// Used to represent function parameter types and return types, local and
@@ -60,6 +87,16 @@ pub enum ValTy {
     Vec(VecTy),
     /// Reference type
     Ref(RefTy),
+}
+
+impl ValTy {
+    pub(crate) const fn default_value(self) -> Val {
+        match self {
+            ValTy::Num(n) => Val::Num(n.default_value()),
+            ValTy::Vec(v) => Val::Vec(v.default_value()),
+            ValTy::Ref(r) => Val::Ref(r.default_value()),
+        }
+    }
 }
 
 /// Used to list the types for function parameters and results.
