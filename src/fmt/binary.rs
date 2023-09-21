@@ -357,10 +357,10 @@ impl Expr {
         };
 
         enum RecursiveTerm {
-            BlockEnd(BlockTy, usize),
-            LoopEnd(BlockTy, usize),
-            IfOnlyEnd(BlockTy, usize, usize),
-            EndElseIf(BlockTy, usize),
+            BlockEnd(usize),
+            LoopEnd(usize),
+            IfOnlyEnd(usize),
+            EndElseIf(usize),
         }
 
         let mut instrs = Vec::new();
@@ -489,20 +489,34 @@ impl Expr {
                 0x02 => {
                     let bt = BlockTy::decode(reader, ctx)?;
                     control_op!(bt);
-                    terms.push(RecursiveTerm::BlockEnd(bt, instrs.len()));
+                    terms.push(RecursiveTerm::BlockEnd(instrs.len()));
+                    instrs.push(Instr::Control(Control::Block {
+                        bt,
+                        end_idx: instrs.len(),
+                    }));
                     continue;
                 }
                 0x03 => {
                     let bt = BlockTy::decode(reader, ctx)?;
                     control_op!(bt);
-                    terms.push(RecursiveTerm::LoopEnd(bt, instrs.len()));
+                    terms.push(RecursiveTerm::LoopEnd(instrs.len()));
+                    instrs.push(Instr::Control(Control::Loop {
+                        bt,
+                        start_idx: instrs.len(),
+                        end_idx: instrs.len(),
+                    }));
                     continue;
                 }
                 0x04 => {
                     let bt = BlockTy::decode(reader, ctx)?;
                     validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
                     control_op!(bt);
-                    terms.push(RecursiveTerm::EndElseIf(bt, instrs.len()));
+                    terms.push(RecursiveTerm::EndElseIf(instrs.len()));
+                    instrs.push(Instr::Control(Control::If {
+                        bt,
+                        then_end_idx: instrs.len(),
+                        el_end_idx: instrs.len(),
+                    }));
                     continue;
                 }
                 0x05 => {
@@ -517,13 +531,21 @@ impl Expr {
                         return Err(DecodeError::InvalidInstr);
                     };
                     match term {
-                        RecursiveTerm::BlockEnd(_, _)
-                        | RecursiveTerm::LoopEnd(_, _)
-                        | RecursiveTerm::IfOnlyEnd(_, _, _) => {
-                            return Err(DecodeError::InvalidInstr)
-                        }
-                        RecursiveTerm::EndElseIf(bt, len) => {
-                            terms.push(RecursiveTerm::IfOnlyEnd(bt, len, instrs.len()));
+                        RecursiveTerm::BlockEnd(_)
+                        | RecursiveTerm::LoopEnd(_)
+                        | RecursiveTerm::IfOnlyEnd(_) => return Err(DecodeError::InvalidInstr),
+                        RecursiveTerm::EndElseIf(index) => {
+                            let len = instrs.len();
+                            let Instr::Control(Control::If {
+                                bt: _,
+                                then_end_idx,
+                                el_end_idx: _,
+                            }) = &mut instrs[index]
+                            else {
+                                unreachable!();
+                            };
+                            *then_end_idx = len;
+                            terms.push(RecursiveTerm::IfOnlyEnd(index));
                         }
                     }
                     continue;
@@ -540,32 +562,51 @@ impl Expr {
                         return Err(DecodeError::InvalidInstr);
                     };
                     match term {
-                        RecursiveTerm::BlockEnd(bt, len) => {
-                            let block_instrs = instrs.split_off(len);
-                            instrs.push(Instr::Control(Control::Block {
-                                bt,
-                                instrs: block_instrs,
-                            }));
+                        RecursiveTerm::BlockEnd(index) => {
+                            let len = instrs.len();
+                            let Instr::Control(Control::Block { bt: _, end_idx }) =
+                                &mut instrs[index]
+                            else {
+                                unreachable!();
+                            };
+                            *end_idx = len;
                         }
-                        RecursiveTerm::LoopEnd(bt, len) => {
-                            let block_instrs = instrs.split_off(len);
-                            instrs.push(Instr::Control(Control::Loop {
-                                bt,
-                                instrs: block_instrs,
-                            }));
+                        RecursiveTerm::LoopEnd(index) => {
+                            let len = instrs.len();
+                            let Instr::Control(Control::Loop {
+                                bt: _,
+                                start_idx: _,
+                                end_idx,
+                            }) = &mut instrs[index]
+                            else {
+                                unreachable!();
+                            };
+                            *end_idx = len;
                         }
-                        RecursiveTerm::IfOnlyEnd(bt, then_len, el_len) => {
-                            let el = instrs.split_off(el_len);
-                            let then = instrs.split_off(then_len);
-                            instrs.push(Instr::Control(Control::If { bt, then, el }));
+                        RecursiveTerm::IfOnlyEnd(index) => {
+                            let len = instrs.len();
+                            let Instr::Control(Control::If {
+                                bt: _,
+                                then_end_idx: _,
+                                el_end_idx,
+                            }) = &mut instrs[index]
+                            else {
+                                unreachable!();
+                            };
+                            *el_end_idx = len;
                         }
-                        RecursiveTerm::EndElseIf(bt, len) => {
-                            let then = instrs.split_off(len);
-                            instrs.push(Instr::Control(Control::If {
-                                bt,
-                                then,
-                                el: Vec::new(),
-                            }));
+                        RecursiveTerm::EndElseIf(index) => {
+                            let len = instrs.len();
+                            let Instr::Control(Control::If {
+                                bt: _,
+                                then_end_idx,
+                                el_end_idx,
+                            }) = &mut instrs[index]
+                            else {
+                                unreachable!();
+                            };
+                            *then_end_idx = len;
+                            *el_end_idx = len;
                         }
                     }
 

@@ -348,14 +348,18 @@ pub enum Control {
     /// 0x01
     Nop,
     /// 0x02
-    Block { bt: BlockTy, instrs: Vec<Instr> },
+    Block { bt: BlockTy, end_idx: usize },
     /// 0x03
-    Loop { bt: BlockTy, instrs: Vec<Instr> },
+    Loop {
+        bt: BlockTy,
+        start_idx: usize,
+        end_idx: usize,
+    },
     /// 0x04
     If {
         bt: BlockTy,
-        then: Vec<Instr>,
-        el: Vec<Instr>,
+        then_end_idx: usize,
+        el_end_idx: usize,
     },
     /// 0x0c
     Br(LabelIndex),
