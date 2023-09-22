@@ -671,7 +671,30 @@ impl Store {
                             values.push(a.into());
                         }
                     },
-                    Instr::Parametric(_) => todo!(),
+                    Instr::Parametric(instr) => match instr {
+                        instr::Parametric::Drop => {
+                            let _ = values.pop();
+                        }
+                        instr::Parametric::Select(t) => {
+                            let c = values.pop_i32();
+                            let val2 = values.pop();
+                            let val1 = values.pop();
+
+                            if let Some(ty) = t {
+                                assert_eq!(ValTy::from(val1), *ty);
+                                assert_eq!(ValTy::from(val2), *ty);
+                            } else {
+                                assert!(matches!(ValTy::from(val1), ValTy::Num(_)));
+                                assert!(matches!(ValTy::from(val2), ValTy::Num(_)));
+                            }
+
+                            if c == 0 {
+                                values.push(val2);
+                            } else {
+                                values.push(val1);
+                            }
+                        }
+                    },
                     Instr::Var(_) => todo!(),
                     Instr::Table(_) => todo!(),
                     Instr::Mem(_) => todo!(),
@@ -1109,8 +1132,8 @@ impl ValStack {
 
     #[inline]
     #[must_use]
-    fn pop(&mut self) -> Option<Val> {
-        self.stack.pop()
+    fn pop(&mut self) -> Val {
+        self.stack.pop().unwrap()
     }
 
     #[inline]

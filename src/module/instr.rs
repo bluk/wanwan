@@ -256,12 +256,15 @@ pub enum Ref {
 }
 
 /// Parametric instruction
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Parametric {
     /// 0x1a
     Drop,
     /// 0x1b and 0x1c
-    Select(Option<Vec<ValTy>>),
+    ///
+    /// XXX: Technically, this should be `Option<Vec<ValTy>>` but the
+    /// specification only supports 1 optional type right now.
+    Select(Option<ValTy>),
 }
 
 /// Variable instruction

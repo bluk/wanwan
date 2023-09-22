@@ -799,7 +799,7 @@ impl Expr {
                     validator.pop_expect_vals(&expected)?;
                     validator.push_vals(&expected);
 
-                    Instr::Parametric(Parametric::Select(Some(t)))
+                    Instr::Parametric(Parametric::Select(Some(t[0])))
                 }
 
                 // Variable Instructions
