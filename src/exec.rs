@@ -617,8 +617,10 @@ impl Store {
                             continue 'call;
                         }
                         instr::Control::CallIndirect { y, x } => {
-                            let frame = frames.last().unwrap();
-                            let func_addr = frame.module.read(|module_inst| {
+                            let cur_frame = frames.last_mut().unwrap();
+                            cur_frame.instr_idx = instr_idx + 1;
+
+                            let func_addr = cur_frame.module.read(|module_inst| {
                                 let t_a = module_inst.table_addr(*x).unwrap();
                                 let tab = &self.tables[usize::from(t_a)];
                                 let ft_expect = module_inst.func_ty(*y).unwrap();
