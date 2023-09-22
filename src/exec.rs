@@ -652,7 +652,25 @@ impl Store {
                             continue 'call;
                         }
                     },
-                    Instr::Ref(_) => todo!(),
+                    Instr::Ref(instr) => match instr {
+                        instr::Ref::RefNull(ty) => {
+                            values.push(Val::Ref(Ref::Null(*ty)));
+                        }
+                        instr::Ref::RefIsNull => {
+                            let r = values.pop_ref();
+                            match r {
+                                Ref::Null(_) => values.push(true.into()),
+                                Ref::Func(_) | Ref::Extern(_) => values.push(false.into()),
+                            }
+                        }
+                        instr::Ref::RefFunc(x) => {
+                            let a = frame
+                                .module
+                                .read(|module_inst| module_inst.func_addr(*x))
+                                .unwrap();
+                            values.push(a.into());
+                        }
+                    },
                     Instr::Parametric(_) => todo!(),
                     Instr::Var(_) => todo!(),
                     Instr::Table(_) => todo!(),
@@ -1110,6 +1128,15 @@ impl ValStack {
         let mut params = self.stack.split_off(self.stack.len() - n);
         params.reverse();
         params
+    }
+
+    #[inline]
+    #[must_use]
+    fn pop_ref(&mut self) -> Ref {
+        let Some(Val::Ref(r)) = self.stack.pop() else {
+            unreachable!()
+        };
+        r
     }
 
     fn pop_ret(&mut self, n: usize) -> Vec<Val> {
