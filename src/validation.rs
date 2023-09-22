@@ -236,8 +236,7 @@ impl FuncExprValidator {
         let mut ctx = ExprContext::default();
         // TODO: Opcode is wrong
         let mut new_locals = func_ty
-            .rt1
-            .0
+            .params()
             .iter()
             .copied()
             .map(Into::into)
@@ -247,8 +246,7 @@ impl FuncExprValidator {
             0,
             new_locals,
             func_ty
-                .rt2
-                .0
+                .ret()
                 .iter()
                 .copied()
                 .map(OpdTy::from)

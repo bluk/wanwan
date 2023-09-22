@@ -200,7 +200,7 @@ impl FuncTy {
         let rt1 = ResultTy::decode(reader)?;
         let rt2 = ResultTy::decode(reader)?;
 
-        Ok(Self { rt1, rt2 })
+        Ok(Self::new(rt1, rt2))
     }
 }
 
@@ -385,8 +385,7 @@ impl Expr {
                             let func_ty = ctx.func_ty(idx).unwrap();
                             // XXX: Allocating here
                             let params = func_ty
-                                .rt1
-                                .0
+                                .params()
                                 .iter()
                                 .copied()
                                 .map(Into::into)
@@ -396,7 +395,7 @@ impl Expr {
                                 op_code,
                                 params,
                                 // XXX: Allocating here
-                                func_ty.rt2.0.iter().copied().map(Into::into).collect(),
+                                func_ty.ret().iter().copied().map(Into::into).collect(),
                             );
                         }
                     }
@@ -697,8 +696,7 @@ impl Expr {
                     };
                     validator.pop_expect_vals(
                         &func_ty
-                            .rt1
-                            .0
+                            .params()
                             .iter()
                             .copied()
                             .map(OpdTy::from)
@@ -706,8 +704,7 @@ impl Expr {
                     )?;
                     validator.push_vals(
                         &func_ty
-                            .rt2
-                            .0
+                            .ret()
                             .iter()
                             .copied()
                             .map(OpdTy::from)
@@ -732,8 +729,7 @@ impl Expr {
                     validator.pop_expect_val(OpdTy::Num(NumTy::I32))?;
 
                     let params = func_ty
-                        .rt1
-                        .0
+                        .params()
                         .iter()
                         .copied()
                         .map(OpdTy::from)
@@ -741,8 +737,7 @@ impl Expr {
                     validator.pop_expect_vals(&params)?;
 
                     let ret = func_ty
-                        .rt2
-                        .0
+                        .ret()
                         .iter()
                         .copied()
                         .map(OpdTy::from)
@@ -2804,7 +2799,7 @@ impl Module {
                     let Some(func_ty) = ctx.func_ty(ty_idx) else {
                         return Err(DecodeError::InvalidStart);
                     };
-                    if !func_ty.is_params_empty() || !func_ty.is_return_empty() {
+                    if !func_ty.params().is_empty() || !func_ty.ret().is_empty() {
                         return Err(DecodeError::InvalidStart);
                     }
                     start = StartFunc::with_start_func(Some(idx));

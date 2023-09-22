@@ -46,6 +46,17 @@ impl From<bool> for Num {
     }
 }
 
+impl From<Num> for NumTy {
+    fn from(value: Num) -> Self {
+        match value {
+            Num::I32(_) => NumTy::I32,
+            Num::I64(_) => NumTy::I64,
+            Num::F32(_) => NumTy::F32,
+            Num::F64(_) => NumTy::F64,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Vec {
     V128(i128),
@@ -57,9 +68,11 @@ impl From<i128> for Vec {
     }
 }
 
-impl Default for Vec {
-    fn default() -> Self {
-        Self::V128(0)
+impl From<Vec> for VecTy {
+    fn from(value: Vec) -> Self {
+        match value {
+            Vec::V128(_) => VecTy::V128,
+        }
     }
 }
 
@@ -79,6 +92,16 @@ impl From<FuncAddr> for Ref {
 impl From<ExternAddr> for Ref {
     fn from(value: ExternAddr) -> Self {
         Self::Extern(value)
+    }
+}
+
+impl From<Ref> for RefTy {
+    fn from(value: Ref) -> Self {
+        match value {
+            Ref::Null(ty) => ty,
+            Ref::Func(_) => RefTy::FuncRef,
+            Ref::Extern(_) => RefTy::ExternRef,
+        }
     }
 }
 
@@ -144,20 +167,9 @@ impl From<ExternAddr> for Val {
 impl From<Val> for ValTy {
     fn from(value: Val) -> Self {
         match value {
-            Val::Num(n) => match n {
-                Num::I32(_) => ValTy::Num(NumTy::I32),
-                Num::I64(_) => ValTy::Num(NumTy::I64),
-                Num::F32(_) => ValTy::Num(NumTy::F32),
-                Num::F64(_) => ValTy::Num(NumTy::F64),
-            },
-            Val::Vec(v) => match v {
-                Vec::V128(_) => ValTy::Vec(VecTy::V128),
-            },
-            Val::Ref(r) => match r {
-                Ref::Null(r) => ValTy::Ref(r),
-                Ref::Func(_) => ValTy::Ref(RefTy::FuncRef),
-                Ref::Extern(_) => ValTy::Ref(RefTy::ExternRef),
-            },
+            Val::Num(n) => ValTy::Num(NumTy::from(n)),
+            Val::Vec(v) => ValTy::Vec(VecTy::from(v)),
+            Val::Ref(r) => ValTy::Ref(RefTy::from(r)),
         }
     }
 }

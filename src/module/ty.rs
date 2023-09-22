@@ -114,25 +114,47 @@ pub struct ResultTy(pub Vec<ValTy>);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuncTy {
     /// Parameter types
-    pub rt1: ResultTy,
+    rt1: ResultTy,
     /// Result types
-    pub rt2: ResultTy,
+    rt2: ResultTy,
 }
 
 impl FuncTy {
-    /// Returns true if the parameter list is empty, false otherwise.
     #[inline]
     #[must_use]
-    pub fn is_params_empty(&self) -> bool {
-        self.rt1.0.is_empty()
+    pub fn new(params: ResultTy, ret: ResultTy) -> Self {
+        Self {
+            rt1: params,
+            rt2: ret,
+        }
     }
 
-    /// Returns true if the return type list is empty, false otherwise.
+    /// Returns the param value types.
     #[inline]
     #[must_use]
-    pub fn is_return_empty(&self) -> bool {
-        self.rt2.0.is_empty()
+    pub fn params(&self) -> &[ValTy] {
+        &self.rt1.0
     }
+
+    /// Returns the return value types.
+    #[inline]
+    #[must_use]
+    pub fn ret(&self) -> &[ValTy] {
+        &self.rt2.0
+    }
+}
+
+#[must_use]
+pub(crate) fn is_compatible(expected: &[ValTy], actual: &[Val]) -> bool {
+    if expected.len() != actual.len() {
+        return false;
+    }
+
+    expected
+        .iter()
+        .copied()
+        .zip(actual.iter().map(|val| ValTy::from(*val)))
+        .all(|(expected, actual)| expected == actual)
 }
 
 /// Minimum and optional maximum limits of `Memory` and `Table`s.

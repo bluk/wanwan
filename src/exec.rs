@@ -414,7 +414,7 @@ impl Store {
         addr: FuncAddr,
         params: &[Val],
     ) -> Result<Vec<Val>, embed::Error> {
-        use crate::exec::val::Num;
+        use crate::{exec::val::Num, module::ty};
 
         let mut frames: Vec<Activation> = Vec::new();
         let mut values: Vec<Val> = Vec::new();
@@ -422,16 +422,8 @@ impl Store {
 
         match self.func(addr).unwrap() {
             FuncInst::Module { ty, module, code } => {
-                if ty.rt1.0.len() != params.len() {
+                if !ty::is_compatible(ty.params(), params) {
                     Err(embed::InnerError::InvalidArguments)?;
-                }
-
-                for (expected, actual) in
-                    ty.rt1.0.iter().zip(params.iter().map(|v| ValTy::from(*v)))
-                {
-                    if *expected != actual {
-                        Err(embed::InnerError::InvalidArguments)?;
-                    }
                 }
 
                 let mut locals = Vec::new();
@@ -445,12 +437,12 @@ impl Store {
                     module: module.clone(),
                     func_addr: addr,
                     instr_idx: 0,
-                    arity: ty.rt2.0.len(),
+                    arity: ty.ret().len(),
                 });
 
                 labels.push(Label {
                     values_height: values.len(),
-                    arity: ty.rt2.0.len(),
+                    arity: ty.ret().len(),
                     end_instr_idx: code.body.instrs.len(),
                     next_instr_idx: None,
                     br_instr_idx: code.body.instrs.len(),
@@ -499,23 +491,17 @@ impl Store {
                                     let func_ty = module_inst.func_ty(*ty_idx).unwrap();
 
                                     let mut params = Vec::new();
-                                    for _ in 0..func_ty.rt1.0.len() {
+                                    for _ in 0..func_ty.params().len() {
                                         params.push(values.pop().unwrap());
                                     }
 
-                                    if func_ty
-                                        .rt1
-                                        .0
-                                        .iter()
-                                        .zip(params.iter().map(|val| ValTy::from(*val)))
-                                        .any(|(expected, actual)| *expected != actual)
-                                    {
+                                    if !ty::is_compatible(func_ty.params(), &params) {
                                         return Err(Trap);
                                     }
 
                                     labels.push(Label {
                                         values_height: values.len(),
-                                        arity: func_ty.rt2.0.len(),
+                                        arity: func_ty.ret().len(),
                                         end_instr_idx: *end_idx,
                                         next_instr_idx: None,
                                         br_instr_idx: *end_idx,
@@ -547,23 +533,17 @@ impl Store {
                                     let func_ty = module_inst.func_ty(*ty_idx).unwrap();
 
                                     let mut params = Vec::new();
-                                    for _ in 0..func_ty.rt1.0.len() {
+                                    for _ in 0..func_ty.params().len() {
                                         params.push(values.pop().unwrap());
                                     }
 
-                                    if func_ty
-                                        .rt1
-                                        .0
-                                        .iter()
-                                        .zip(params.iter().map(|val| ValTy::from(*val)))
-                                        .any(|(expected, actual)| *expected != actual)
-                                    {
+                                    if !ty::is_compatible(func_ty.params(), &params) {
                                         return Err(Trap);
                                     }
 
                                     labels.push(Label {
                                         values_height: values.len(),
-                                        arity: func_ty.rt1.0.len(),
+                                        arity: func_ty.ret().len(),
                                         end_instr_idx: *end_idx,
                                         next_instr_idx: None,
                                         br_instr_idx: *start_idx,
@@ -605,23 +585,17 @@ impl Store {
                                         let func_ty = module_inst.func_ty(*ty_idx).unwrap();
 
                                         let mut params = Vec::new();
-                                        for _ in 0..func_ty.rt1.0.len() {
+                                        for _ in 0..func_ty.params().len() {
                                             params.push(values.pop().unwrap());
                                         }
 
-                                        if func_ty
-                                            .rt1
-                                            .0
-                                            .iter()
-                                            .zip(params.iter().map(|val| ValTy::from(*val)))
-                                            .any(|(expected, actual)| *expected != actual)
-                                        {
+                                        if !ty::is_compatible(func_ty.params(), &params) {
                                             return Err(Trap);
                                         }
 
                                         labels.push(Label {
                                             values_height: values.len(),
-                                            arity: func_ty.rt2.0.len(),
+                                            arity: func_ty.ret().len(),
                                             end_instr_idx: if c {
                                                 *then_end_idx
                                             } else {
@@ -690,7 +664,7 @@ impl Store {
                             let func = self.func_mut(func_addr).unwrap();
                             match func {
                                 FuncInst::Module { ty, module, code } => {
-                                    let n = ty.rt1.0.len();
+                                    let n = ty.params().len();
                                     let mut params = Vec::new();
                                     for _ in 0..n {
                                         let Some(val) = values.pop() else {
@@ -699,12 +673,8 @@ impl Store {
                                         params.push(val);
                                     }
 
-                                    for (expected, actual) in
-                                        ty.rt1.0.iter().zip(params.iter().map(|v| ValTy::from(*v)))
-                                    {
-                                        if *expected != actual {
-                                            unreachable!()
-                                        }
+                                    if !ty::is_compatible(ty.params(), &params) {
+                                        unreachable!()
                                     }
 
                                     let mut locals = Vec::new();
@@ -720,19 +690,19 @@ impl Store {
                                         module: module.clone(),
                                         func_addr,
                                         instr_idx: 0,
-                                        arity: ty.rt2.0.len(),
+                                        arity: ty.ret().len(),
                                     });
 
                                     labels.push(Label {
                                         values_height: values.len(),
-                                        arity: ty.rt2.0.len(),
+                                        arity: ty.ret().len(),
                                         end_instr_idx: code.body.instrs.len(),
                                         next_instr_idx: None,
                                         br_instr_idx: code.body.instrs.len(),
                                     });
                                 }
                                 FuncInst::Host { ty, hostcode } => {
-                                    let n = ty.rt1.0.len();
+                                    let n = ty.params().len();
                                     let mut params = Vec::new();
                                     for _ in 0..n {
                                         let Some(val) = values.pop() else {
@@ -741,14 +711,14 @@ impl Store {
                                         params.push(val);
                                     }
 
+                                    if !ty::is_compatible(ty.params(), &params) {
+                                        unreachable!()
+                                    }
+
                                     match hostcode(&params) {
                                         Ok(res) => {
-                                            for (expected, actual) in
-                                                ty.rt2.0.iter().zip(res.iter())
-                                            {
-                                                if ValTy::from(*actual) != *expected {
-                                                    return Err(Trap)?;
-                                                }
+                                            if !ty::is_compatible(ty.ret(), &res) {
+                                                return Err(Trap)?;
                                             }
 
                                             for r in res {
@@ -799,7 +769,7 @@ impl Store {
                             let func = self.func_mut(func_addr).unwrap();
                             match func {
                                 FuncInst::Module { ty, module, code } => {
-                                    let n = ty.rt1.0.len();
+                                    let n = ty.params().len();
                                     let mut params = Vec::new();
                                     for _ in 0..n {
                                         let Some(val) = values.pop() else {
@@ -808,12 +778,8 @@ impl Store {
                                         params.push(val);
                                     }
 
-                                    for (expected, actual) in
-                                        ty.rt1.0.iter().zip(params.iter().map(|v| ValTy::from(*v)))
-                                    {
-                                        if *expected != actual {
-                                            unreachable!()
-                                        }
+                                    if !ty::is_compatible(ty.params(), &params) {
+                                        unreachable!()
                                     }
 
                                     let mut locals = Vec::new();
@@ -829,19 +795,19 @@ impl Store {
                                         module: module.clone(),
                                         func_addr,
                                         instr_idx: 0,
-                                        arity: ty.rt2.0.len(),
+                                        arity: ty.ret().len(),
                                     });
 
                                     labels.push(Label {
                                         values_height: values.len(),
-                                        arity: ty.rt2.0.len(),
+                                        arity: ty.ret().len(),
                                         end_instr_idx: code.body.instrs.len(),
                                         next_instr_idx: None,
                                         br_instr_idx: code.body.instrs.len(),
                                     });
                                 }
                                 FuncInst::Host { ty, hostcode } => {
-                                    let n = ty.rt1.0.len();
+                                    let n = ty.params().len();
                                     let mut params = Vec::new();
                                     for _ in 0..n {
                                         let Some(val) = values.pop() else {
@@ -852,12 +818,8 @@ impl Store {
 
                                     match hostcode(&params) {
                                         Ok(res) => {
-                                            for (expected, actual) in
-                                                ty.rt2.0.iter().zip(res.iter())
-                                            {
-                                                if ValTy::from(*actual) != *expected {
-                                                    return Err(Trap)?;
-                                                }
+                                            if !ty::is_compatible(ty.ret(), &res) {
+                                                return Err(Trap)?;
                                             }
 
                                             for r in res {
@@ -932,16 +894,8 @@ impl Store {
                 ret.push(val);
             }
 
-            if self
-                .func(last_frame.func_addr)
-                .unwrap()
-                .ty()
-                .rt2
-                .0
-                .iter()
-                .zip(ret.iter())
-                .any(|(expected, actual)| *expected != ValTy::from(*actual))
-            {
+            let func_ty = self.func(last_frame.func_addr).unwrap().ty();
+            if !ty::is_compatible(func_ty.ret(), &ret) {
                 return Err(Trap)?;
             }
 
