@@ -33,7 +33,6 @@ use crate::exec::ModuleInst;
 pub(crate) enum InnerError {
     Decode(String, u64),
     Exec(exec::Error),
-    InvalidArguments,
     InvalidImport,
     UnknownExport,
     Trap,
@@ -93,7 +92,6 @@ impl fmt::Display for Error {
         match &self.inner {
             InnerError::Decode(error, _) => f.write_str(error),
             InnerError::Exec(error) => fmt::Display::fmt(error, f),
-            InnerError::InvalidArguments => f.write_str("invalid arguments"),
             InnerError::InvalidImport => f.write_str("invalid import"),
             InnerError::Trap => f.write_str("trap"),
             InnerError::UnknownExport => f.write_str("unknown export"),
@@ -106,7 +104,6 @@ impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match &self.inner {
             InnerError::Decode(_, _)
-            | InnerError::InvalidArguments
             | InnerError::InvalidImport
             | InnerError::Trap
             | InnerError::UnknownExport => None,

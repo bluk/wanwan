@@ -17,7 +17,7 @@ use crate::{
     embed,
     module::{
         instr::{self, Const, ConstExpr, ConstInstr, Instr},
-        ty::{FuncTy, GlobalTy, MemTy, Mut, RefTy, TableTy, ValTy},
+        ty::{self, FuncTy, GlobalTy, MemTy, Mut, RefTy, TableTy, ValTy},
         DataIndex, ElementIndex, Func, FuncIndex, GlobalIndex, ImportGlobalIndex, LabelIndex,
         MemIndex, TableIndex, TypeIndex,
     },
@@ -414,42 +414,14 @@ impl Store {
         addr: FuncAddr,
         params: &[Val],
     ) -> Result<Vec<Val>, embed::Error> {
-        use crate::{exec::val::Num, module::ty};
+        use crate::exec::val::Num;
 
         let mut frames: Vec<Activation> = Vec::new();
         let mut values: Vec<Val> = Vec::new();
         let mut labels: Vec<Label> = Vec::new();
 
-        match self.func(addr).unwrap() {
-            FuncInst::Module { ty, module, code } => {
-                if !ty::is_compatible(ty.params(), params) {
-                    Err(embed::InnerError::InvalidArguments)?;
-                }
-
-                let mut locals = Vec::new();
-                locals.extend(params.iter().rev());
-                locals.extend(code.locals.iter().copied().map(ValTy::default_value));
-
-                frames.push(Activation {
-                    values_height: values.len(),
-                    labels_height: labels.len(),
-                    locals,
-                    module: module.clone(),
-                    func_addr: addr,
-                    instr_idx: 0,
-                    arity: ty.ret().len(),
-                });
-
-                labels.push(Label {
-                    values_height: values.len(),
-                    arity: ty.ret().len(),
-                    end_instr_idx: code.body.instrs.len(),
-                    next_instr_idx: None,
-                    br_instr_idx: code.body.instrs.len(),
-                });
-            }
-            FuncInst::Host { ty: _, hostcode: _ } => todo!(),
-        };
+        values.extend(params.iter().copied().rev());
+        func_call(self, addr, &mut frames, &mut labels, &mut values)?;
 
         'call: loop {
             let frame = frames.last().unwrap();
@@ -661,77 +633,7 @@ impl Store {
                                 .module
                                 .read(|module_inst| module_inst.func_addr(idx))
                                 .unwrap();
-                            let func = self.func_mut(func_addr).unwrap();
-                            match func {
-                                FuncInst::Module { ty, module, code } => {
-                                    let n = ty.params().len();
-                                    let mut params = Vec::new();
-                                    for _ in 0..n {
-                                        let Some(val) = values.pop() else {
-                                            unreachable!()
-                                        };
-                                        params.push(val);
-                                    }
-
-                                    if !ty::is_compatible(ty.params(), &params) {
-                                        unreachable!()
-                                    }
-
-                                    let mut locals = Vec::new();
-                                    locals.extend(params.iter().rev());
-                                    locals.extend(
-                                        code.locals.iter().copied().map(ValTy::default_value),
-                                    );
-
-                                    frames.push(Activation {
-                                        values_height: values.len(),
-                                        labels_height: labels.len(),
-                                        locals,
-                                        module: module.clone(),
-                                        func_addr,
-                                        instr_idx: 0,
-                                        arity: ty.ret().len(),
-                                    });
-
-                                    labels.push(Label {
-                                        values_height: values.len(),
-                                        arity: ty.ret().len(),
-                                        end_instr_idx: code.body.instrs.len(),
-                                        next_instr_idx: None,
-                                        br_instr_idx: code.body.instrs.len(),
-                                    });
-                                }
-                                FuncInst::Host { ty, hostcode } => {
-                                    let n = ty.params().len();
-                                    let mut params = Vec::new();
-                                    for _ in 0..n {
-                                        let Some(val) = values.pop() else {
-                                            unreachable!()
-                                        };
-                                        params.push(val);
-                                    }
-
-                                    if !ty::is_compatible(ty.params(), &params) {
-                                        unreachable!()
-                                    }
-
-                                    match hostcode(&params) {
-                                        Ok(res) => {
-                                            if !ty::is_compatible(ty.ret(), &res) {
-                                                return Err(Trap)?;
-                                            }
-
-                                            for r in res {
-                                                values.push(r);
-                                            }
-                                        }
-                                        Err(_) => {
-                                            // TODO: Return the right error
-                                            return Err(Trap)?;
-                                        }
-                                    }
-                                }
-                            }
+                            func_call(self, func_addr, &mut frames, &mut labels, &mut values)?;
                             continue 'call;
                         }
                         instr::Control::CallIndirect { y, x } => {
@@ -766,73 +668,7 @@ impl Store {
                                 Ok(*a)
                             })?;
 
-                            let func = self.func_mut(func_addr).unwrap();
-                            match func {
-                                FuncInst::Module { ty, module, code } => {
-                                    let n = ty.params().len();
-                                    let mut params = Vec::new();
-                                    for _ in 0..n {
-                                        let Some(val) = values.pop() else {
-                                            unreachable!()
-                                        };
-                                        params.push(val);
-                                    }
-
-                                    if !ty::is_compatible(ty.params(), &params) {
-                                        unreachable!()
-                                    }
-
-                                    let mut locals = Vec::new();
-                                    locals.extend(params.iter().rev());
-                                    locals.extend(
-                                        code.locals.iter().copied().map(ValTy::default_value),
-                                    );
-
-                                    frames.push(Activation {
-                                        values_height: values.len(),
-                                        labels_height: labels.len(),
-                                        locals,
-                                        module: module.clone(),
-                                        func_addr,
-                                        instr_idx: 0,
-                                        arity: ty.ret().len(),
-                                    });
-
-                                    labels.push(Label {
-                                        values_height: values.len(),
-                                        arity: ty.ret().len(),
-                                        end_instr_idx: code.body.instrs.len(),
-                                        next_instr_idx: None,
-                                        br_instr_idx: code.body.instrs.len(),
-                                    });
-                                }
-                                FuncInst::Host { ty, hostcode } => {
-                                    let n = ty.params().len();
-                                    let mut params = Vec::new();
-                                    for _ in 0..n {
-                                        let Some(val) = values.pop() else {
-                                            unreachable!()
-                                        };
-                                        params.push(val);
-                                    }
-
-                                    match hostcode(&params) {
-                                        Ok(res) => {
-                                            if !ty::is_compatible(ty.ret(), &res) {
-                                                return Err(Trap)?;
-                                            }
-
-                                            for r in res {
-                                                values.push(r);
-                                            }
-                                        }
-                                        Err(_) => {
-                                            // TODO: Return the right error
-                                            return Err(Trap)?;
-                                        }
-                                    }
-                                }
-                            }
+                            func_call(self, func_addr, &mut frames, &mut labels, &mut values)?;
                             continue 'call;
                         }
                     },
@@ -1314,4 +1150,84 @@ fn branch(
     values.extend(params.into_iter().rev());
     let label = labels.last().unwrap();
     *instr_idx = label.br_instr_idx;
+}
+
+#[cfg(feature = "std")]
+fn func_call(
+    store: &mut Store,
+    addr: FuncAddr,
+    frames: &mut Vec<Activation>,
+    labels: &mut Vec<Label>,
+    values: &mut Vec<Val>,
+) -> Result<(), embed::Error> {
+    match store.func_mut(addr).unwrap() {
+        FuncInst::Module { ty, module, code } => {
+            let n = ty.params().len();
+            let mut params = Vec::new();
+            for _ in 0..n {
+                let Some(val) = values.pop() else {
+                    unreachable!()
+                };
+                params.push(val);
+            }
+
+            if !ty::is_compatible(ty.params(), &params) {
+                unreachable!()
+            }
+
+            let mut locals = Vec::new();
+            locals.extend(params.iter().rev());
+            locals.extend(code.locals.iter().copied().map(ValTy::default_value));
+
+            frames.push(Activation {
+                values_height: values.len(),
+                labels_height: labels.len(),
+                locals,
+                module: module.clone(),
+                func_addr: addr,
+                instr_idx: 0,
+                arity: ty.ret().len(),
+            });
+
+            labels.push(Label {
+                values_height: values.len(),
+                arity: ty.ret().len(),
+                end_instr_idx: code.body.instrs.len(),
+                next_instr_idx: None,
+                br_instr_idx: code.body.instrs.len(),
+            });
+        }
+        FuncInst::Host { ty, hostcode } => {
+            let n = ty.params().len();
+            let mut params = Vec::new();
+            for _ in 0..n {
+                let Some(val) = values.pop() else {
+                    unreachable!()
+                };
+                params.push(val);
+            }
+
+            if !ty::is_compatible(ty.params(), &params) {
+                unreachable!()
+            }
+
+            match hostcode(&params) {
+                Ok(res) => {
+                    if !ty::is_compatible(ty.ret(), &res) {
+                        Err(Trap)?;
+                    }
+
+                    for r in res {
+                        values.push(r);
+                    }
+                }
+                Err(_) => {
+                    // TODO: Return the right error
+                    Err(Trap)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
