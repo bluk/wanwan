@@ -23,7 +23,7 @@ use crate::{
     },
 };
 
-use self::val::{ExternVal, Ref, Val};
+use self::val::{ExternVal, Num, Ref, Val};
 
 pub mod val;
 
@@ -414,13 +414,11 @@ impl Store {
         addr: FuncAddr,
         params: &[Val],
     ) -> Result<Vec<Val>, embed::Error> {
-        use crate::exec::val::Num;
-
         let mut frames: Vec<Activation> = Vec::new();
-        let mut values: Vec<Val> = Vec::new();
+        let mut values: ValStack = ValStack::new();
         let mut labels: Vec<Label> = Vec::new();
 
-        values.extend(params.iter().copied().rev());
+        values.push_params(params);
         func_call(self, addr, &mut frames, &mut labels, &mut values)?;
 
         'call: loop {
@@ -462,10 +460,7 @@ impl Store {
                                 frame.module.read(|module_inst| {
                                     let func_ty = module_inst.func_ty(*ty_idx).unwrap();
 
-                                    let mut params = Vec::new();
-                                    for _ in 0..func_ty.params().len() {
-                                        params.push(values.pop().unwrap());
-                                    }
+                                    let params = values.pop_params(func_ty.params().len());
 
                                     if !ty::is_compatible(func_ty.params(), &params) {
                                         return Err(Trap);
@@ -479,7 +474,7 @@ impl Store {
                                         br_instr_idx: *end_idx,
                                     });
 
-                                    values.extend(params.iter().rev());
+                                    values.push_params(&params);
 
                                     Ok(())
                                 })?;
@@ -504,10 +499,7 @@ impl Store {
                                 frame.module.read(|module_inst| {
                                     let func_ty = module_inst.func_ty(*ty_idx).unwrap();
 
-                                    let mut params = Vec::new();
-                                    for _ in 0..func_ty.params().len() {
-                                        params.push(values.pop().unwrap());
-                                    }
+                                    let params = values.pop_params(func_ty.params().len());
 
                                     if !ty::is_compatible(func_ty.params(), &params) {
                                         return Err(Trap);
@@ -521,7 +513,7 @@ impl Store {
                                         br_instr_idx: *start_idx,
                                     });
 
-                                    values.extend(params.iter().rev());
+                                    values.push_params(&params);
 
                                     Ok(())
                                 })?;
@@ -532,9 +524,7 @@ impl Store {
                             then_end_idx,
                             el_end_idx,
                         } => {
-                            let Some(Val::Num(Num::I32(c))) = values.pop() else {
-                                unreachable!()
-                            };
+                            let c = values.pop_i32();
 
                             let c = c != 0;
                             if !c {
@@ -556,10 +546,7 @@ impl Store {
                                     frame.module.read(|module_inst| {
                                         let func_ty = module_inst.func_ty(*ty_idx).unwrap();
 
-                                        let mut params = Vec::new();
-                                        for _ in 0..func_ty.params().len() {
-                                            params.push(values.pop().unwrap());
-                                        }
+                                        let params = values.pop_params(func_ty.params().len());
 
                                         if !ty::is_compatible(func_ty.params(), &params) {
                                             return Err(Trap);
@@ -577,7 +564,7 @@ impl Store {
                                             br_instr_idx: *el_end_idx,
                                         });
 
-                                        values.extend(params.iter().rev());
+                                        values.push_params(&params);
 
                                         Ok(())
                                     })?;
@@ -588,18 +575,14 @@ impl Store {
                             branch(*l, &mut labels, &mut values, &mut instr_idx);
                         }
                         instr::Control::BrIf(l) => {
-                            let Some(Val::Num(Num::I32(c))) = values.pop() else {
-                                unreachable!()
-                            };
+                            let c = values.pop_i32();
 
                             if c != 0 {
                                 branch(*l, &mut labels, &mut values, &mut instr_idx);
                             }
                         }
                         instr::Control::BrTable { table, idx } => {
-                            let Some(Val::Num(Num::I32(c))) = values.pop() else {
-                                unreachable!()
-                            };
+                            let c = values.pop_i32();
                             let c = usize::try_from(c).unwrap();
                             if c < table.len() {
                                 branch(table[c], &mut labels, &mut values, &mut instr_idx);
@@ -609,19 +592,16 @@ impl Store {
                         }
                         instr::Control::Return => {
                             let frame = frames.last().unwrap();
-                            let n = frame.arity;
-                            let mut params = Vec::new();
-                            for _ in 0..n {
-                                params.push(values.pop().unwrap());
-                            }
+                            let params = values.pop_ret(frame.arity);
+
                             while values.len() > frame.values_height {
-                                values.pop();
+                                let _ = values.pop();
                             }
                             while labels.len() > frame.labels_height {
-                                labels.pop();
+                                let _ = labels.pop();
                             }
                             frames.pop();
-                            values.extend(params.into_iter().rev());
+                            values.push_ret(&params);
                             continue 'call;
                         }
                         instr::Control::Call(idx) => {
@@ -642,9 +622,7 @@ impl Store {
                                 let t_a = module_inst.table_addr(*x).unwrap();
                                 let tab = &self.tables[usize::from(t_a)];
                                 let ft_expect = module_inst.func_ty(*y).unwrap();
-                                let Some(Val::Num(Num::I32(i))) = values.pop() else {
-                                    unreachable!()
-                                };
+                                let i = values.pop_i32();
                                 let i = usize::try_from(i).unwrap();
                                 let Some(r) = tab.elem.get(i) else {
                                     return Err(Trap);
@@ -722,13 +700,7 @@ impl Store {
             debug_assert_eq!(labels.len(), last_frame.labels_height);
             debug_assert_eq!(values.len(), last_frame.values_height + last_frame.arity);
 
-            let mut ret = Vec::new();
-            for _ in 0..last_frame.arity {
-                let Some(val) = values.pop() else {
-                    unreachable!()
-                };
-                ret.push(val);
-            }
+            let ret = values.pop_ret(last_frame.arity);
 
             let func_ty = self.func(last_frame.func_addr).unwrap().ty();
             if !ty::is_compatible(func_ty.ret(), &ret) {
@@ -737,15 +709,14 @@ impl Store {
 
             frames.pop();
 
-            for r in ret {
-                values.push(r);
-            }
+            values.push_ret(&ret);
 
             if frames.is_empty() {
                 break;
             }
         }
 
+        let mut values = values.into_inner();
         values.reverse();
         Ok(values)
     }
@@ -1100,6 +1071,72 @@ impl ConstExpr {
 }
 
 #[derive(Debug)]
+struct ValStack {
+    stack: Vec<Val>,
+}
+
+impl ValStack {
+    #[inline]
+    #[must_use]
+    const fn new() -> Self {
+        Self { stack: Vec::new() }
+    }
+
+    #[must_use]
+    fn len(&self) -> usize {
+        self.stack.len()
+    }
+
+    #[inline]
+    #[must_use]
+    fn pop(&mut self) -> Option<Val> {
+        self.stack.pop()
+    }
+
+    #[inline]
+    #[must_use]
+    fn pop_i32(&mut self) -> i32 {
+        let Some(Val::Num(Num::I32(c))) = self.stack.pop() else {
+            unreachable!()
+        };
+        c
+    }
+
+    #[inline]
+    #[must_use]
+    fn pop_params(&mut self, n: usize) -> Vec<Val> {
+        let mut params = self.stack.split_off(self.stack.len() - n);
+        params.reverse();
+        params
+    }
+
+    fn pop_ret(&mut self, n: usize) -> Vec<Val> {
+        self.pop_params(n)
+    }
+
+    #[inline]
+    fn push(&mut self, param: Val) {
+        self.stack.push(param);
+    }
+
+    #[inline]
+    fn push_params(&mut self, params: &[Val]) {
+        self.stack.extend(params.iter().copied().rev());
+    }
+
+    #[inline]
+    fn push_ret(&mut self, ret: &[Val]) {
+        self.push_params(ret);
+    }
+
+    #[inline]
+    #[must_use]
+    fn into_inner(self) -> Vec<Val> {
+        self.stack
+    }
+}
+
+#[derive(Debug)]
 struct Label {
     values_height: usize,
     arity: usize,
@@ -1126,28 +1163,25 @@ struct Activation {
 fn branch(
     label_idx: LabelIndex,
     labels: &mut Vec<Label>,
-    values: &mut Vec<Val>,
+    values: &mut ValStack,
     instr_idx: &mut usize,
 ) {
     let mut l = usize::try_from(label_idx).unwrap();
     debug_assert!(l < labels.len());
     let n = labels[labels.len() - l - 1].arity;
-    let mut params = Vec::new();
-    for _ in 0..n {
-        params.push(values.pop().unwrap());
-    }
+    let params = values.pop_params(n);
 
     while l + 1 > 0 {
         let label = labels.pop().unwrap();
         debug_assert!(values.len() >= label.values_height);
         while values.len() > label.values_height {
-            values.pop();
+            let _ = values.pop();
         }
 
         l -= 1;
     }
 
-    values.extend(params.into_iter().rev());
+    values.push_params(&params);
     let label = labels.last().unwrap();
     *instr_idx = label.br_instr_idx;
 }
@@ -1158,18 +1192,12 @@ fn func_call(
     addr: FuncAddr,
     frames: &mut Vec<Activation>,
     labels: &mut Vec<Label>,
-    values: &mut Vec<Val>,
+    values: &mut ValStack,
 ) -> Result<(), embed::Error> {
     match store.func_mut(addr).unwrap() {
         FuncInst::Module { ty, module, code } => {
             let n = ty.params().len();
-            let mut params = Vec::new();
-            for _ in 0..n {
-                let Some(val) = values.pop() else {
-                    unreachable!()
-                };
-                params.push(val);
-            }
+            let params = values.pop_params(n);
 
             if !ty::is_compatible(ty.params(), &params) {
                 unreachable!()
@@ -1199,13 +1227,7 @@ fn func_call(
         }
         FuncInst::Host { ty, hostcode } => {
             let n = ty.params().len();
-            let mut params = Vec::new();
-            for _ in 0..n {
-                let Some(val) = values.pop() else {
-                    unreachable!()
-                };
-                params.push(val);
-            }
+            let params = values.pop_params(n);
 
             if !ty::is_compatible(ty.params(), &params) {
                 unreachable!()
@@ -1217,9 +1239,7 @@ fn func_call(
                         Err(Trap)?;
                     }
 
-                    for r in res {
-                        values.push(r);
-                    }
+                    values.push_ret(&res);
                 }
                 Err(_) => {
                     // TODO: Return the right error
