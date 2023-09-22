@@ -414,7 +414,7 @@ impl Store {
         addr: FuncAddr,
         params: &[Val],
     ) -> Result<Vec<Val>, embed::Error> {
-        let mut frames: Vec<Activation> = Vec::new();
+        let mut frames: FrameStack = FrameStack::new();
         let mut values: ValStack = ValStack::new();
         let mut labels: Vec<Label> = Vec::new();
 
@@ -422,7 +422,7 @@ impl Store {
         func_call(self, addr, &mut frames, &mut labels, &mut values)?;
 
         'call: loop {
-            let frame = frames.last().unwrap();
+            let frame = frames.current_mut();
 
             let instrs = match &self.funcs[usize::from(frame.func_addr)] {
                 FuncInst::Module {
@@ -456,7 +456,6 @@ impl Store {
                                 });
                             }
                             instr::BlockTy::Index(ty_idx) => {
-                                let frame = frames.last().unwrap();
                                 frame.module.read(|module_inst| {
                                     let func_ty = module_inst.func_ty(*ty_idx).unwrap();
 
@@ -495,7 +494,6 @@ impl Store {
                                 });
                             }
                             instr::BlockTy::Index(ty_idx) => {
-                                let frame = frames.last().unwrap();
                                 frame.module.read(|module_inst| {
                                     let func_ty = module_inst.func_ty(*ty_idx).unwrap();
 
@@ -542,7 +540,6 @@ impl Store {
                                     });
                                 }
                                 instr::BlockTy::Index(ty_idx) => {
-                                    let frame = frames.last().unwrap();
                                     frame.module.read(|module_inst| {
                                         let func_ty = module_inst.func_ty(*ty_idx).unwrap();
 
@@ -591,7 +588,6 @@ impl Store {
                             }
                         }
                         instr::Control::Return => {
-                            let frame = frames.last().unwrap();
                             let params = values.pop_ret(frame.arity);
 
                             while values.len() > frame.values_height {
@@ -600,16 +596,15 @@ impl Store {
                             while labels.len() > frame.labels_height {
                                 let _ = labels.pop();
                             }
-                            frames.pop();
+                            let _ = frames.pop();
                             values.push_ret(&params);
                             continue 'call;
                         }
                         instr::Control::Call(idx) => {
                             let idx = *idx;
-                            let cur_frame = frames.last_mut().unwrap();
-                            cur_frame.instr_idx = instr_idx + 1;
+                            frame.instr_idx = instr_idx + 1;
 
-                            let func_addr = cur_frame
+                            let func_addr = frame
                                 .module
                                 .read(|module_inst| module_inst.func_addr(idx))
                                 .unwrap();
@@ -617,10 +612,9 @@ impl Store {
                             continue 'call;
                         }
                         instr::Control::CallIndirect { y, x } => {
-                            let cur_frame = frames.last_mut().unwrap();
-                            cur_frame.instr_idx = instr_idx + 1;
+                            frame.instr_idx = instr_idx + 1;
 
-                            let func_addr = cur_frame.module.read(|module_inst| {
+                            let func_addr = frame.module.read(|module_inst| {
                                 let t_a = module_inst.table_addr(*x).unwrap();
                                 let tab = &self.tables[usize::from(t_a)];
                                 let ft_expect = module_inst.func_ty(*y).unwrap();
@@ -695,7 +689,40 @@ impl Store {
                             }
                         }
                     },
-                    Instr::Var(_) => todo!(),
+                    Instr::Var(instr) => match instr {
+                        instr::Variable::LocalGet(x) => {
+                            values.push(frame.locals[usize::try_from(*x).unwrap()]);
+                        }
+                        instr::Variable::LocalSet(x) => {
+                            let val = values.pop();
+                            frame.locals[usize::try_from(*x).unwrap()] = val;
+                        }
+                        instr::Variable::LocalTee(x) => {
+                            let val = values.pop();
+                            values.push(val);
+                            frame.locals[usize::try_from(*x).unwrap()] = val;
+                        }
+                        instr::Variable::GlobalGet(x) => {
+                            let a = frame
+                                .module
+                                .read(|module_inst| module_inst.global_addr(*x))
+                                .unwrap();
+                            let glob = &self.globals[usize::from(a)];
+                            let val = glob.value;
+                            values.push(val);
+                        }
+                        instr::Variable::GlobalSet(x) => {
+                            let a = frame
+                                .module
+                                .read(|module_inst| module_inst.global_addr(*x))
+                                .unwrap();
+                            let val = values.pop();
+                            let glob = &mut self.globals[usize::from(a)];
+                            debug_assert_eq!(glob.ty.t, ValTy::from(val));
+                            debug_assert_eq!(glob.ty.m, Mut::Var);
+                            glob.value = val;
+                        }
+                    },
                     Instr::Table(_) => todo!(),
                     Instr::Mem(_) => todo!(),
                     Instr::Num(instr) => match instr {
@@ -739,7 +766,7 @@ impl Store {
             let last_label = labels.pop().unwrap();
             debug_assert_eq!(last_label.next_instr_idx, None);
 
-            let last_frame = frames.last().unwrap();
+            let last_frame = frames.pop();
             debug_assert_eq!(labels.len(), last_frame.labels_height);
             debug_assert_eq!(values.len(), last_frame.values_height + last_frame.arity);
 
@@ -749,8 +776,6 @@ impl Store {
             if !ty::is_compatible(func_ty.ret(), &ret) {
                 return Err(Trap)?;
             }
-
-            frames.pop();
 
             values.push_ret(&ret);
 
@@ -1212,6 +1237,44 @@ struct Activation {
     arity: usize,
 }
 
+#[cfg(feature = "std")]
+#[derive(Debug)]
+struct FrameStack {
+    stack: Vec<Activation>,
+}
+
+#[cfg(feature = "std")]
+impl FrameStack {
+    #[inline]
+    #[must_use]
+    fn new() -> Self {
+        Self { stack: Vec::new() }
+    }
+
+    #[inline]
+    #[must_use]
+    fn current_mut(&mut self) -> &mut Activation {
+        self.stack.last_mut().unwrap()
+    }
+
+    #[inline]
+    #[must_use]
+    fn is_empty(&self) -> bool {
+        self.stack.is_empty()
+    }
+
+    #[inline]
+    #[must_use]
+    fn pop(&mut self) -> Activation {
+        self.stack.pop().unwrap()
+    }
+
+    #[inline]
+    fn push(&mut self, frame: Activation) {
+        self.stack.push(frame);
+    }
+}
+
 fn branch(
     label_idx: LabelIndex,
     labels: &mut Vec<Label>,
@@ -1242,7 +1305,7 @@ fn branch(
 fn func_call(
     store: &mut Store,
     addr: FuncAddr,
-    frames: &mut Vec<Activation>,
+    frames: &mut FrameStack,
     labels: &mut Vec<Label>,
     values: &mut ValStack,
 ) -> Result<(), embed::Error> {
