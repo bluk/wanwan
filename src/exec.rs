@@ -2,7 +2,7 @@
 
 #[cfg(all(feature = "alloc", not(feature = "std")))]
 use alloc::{boxed::Box, fmt, string::String, vec, vec::Vec};
-use core::ops::Deref;
+use core::{iter, ops::Deref};
 #[cfg(feature = "std")]
 use std::{
     boxed::Box,
@@ -197,22 +197,8 @@ impl Store {
         u32::try_from(self.tables.get(addr.0).map(|t| t.elem.len()).unwrap()).unwrap()
     }
 
-    pub(crate) fn table_grow(&mut self, addr: TableAddr, n: u32, r: Ref) -> Result<(), Error> {
-        let table = self
-            .tables
-            .get_mut(addr.0)
-            .ok_or(InnerError::CouldNotGrowTable)?;
-        if let Some(max) = table.ty.lim.max {
-            if n > max {
-                return Err(InnerError::CouldNotGrowTable)?;
-            }
-        }
-        let n = usize::try_from(n).unwrap();
-        if n < table.elem.len() {
-            return Err(InnerError::CouldNotGrowTable)?;
-        }
-        table.elem.resize(n, r);
-        Ok(())
+    pub(crate) fn table_grow(&mut self, addr: TableAddr, n: u32, r: Ref) -> Result<usize, Error> {
+        table_grow(&mut self.tables, addr, n, r)
     }
 
     pub(crate) fn table_init<M>(
@@ -294,6 +280,7 @@ impl Store {
             .mems
             .get_mut(addr.0)
             .ok_or(InnerError::CouldNotGrowMemory)?;
+        // TODO: Need to following the growing memories algorithm in the spec
         if let Some(max) = mem.ty.lim.max {
             if n > max {
                 return Err(InnerError::CouldNotGrowMemory)?;
@@ -723,7 +710,77 @@ impl Store {
                             glob.value = val;
                         }
                     },
-                    Instr::Table(_) => todo!(),
+                    Instr::Table(instr) => match instr {
+                        instr::Table::TableGet(x) => {
+                            let a = frame
+                                .module
+                                .read(|module_inst| module_inst.table_addr(*x))
+                                .unwrap();
+                            let tab = &self.tables[usize::from(a)];
+                            let i = values.pop_i32();
+                            let i = usize::try_from(i).unwrap();
+                            if i >= tab.elem.len() {
+                                return Err(Trap)?;
+                            }
+                            let val = tab.elem[i];
+                            values.push(val.into());
+                        }
+                        instr::Table::TableSet(x) => {
+                            let a = frame
+                                .module
+                                .read(|module_inst| module_inst.table_addr(*x))
+                                .unwrap();
+                            let tab = &mut self.tables[usize::from(a)];
+                            let val = values.pop_ref();
+                            let i = values.pop_i32();
+                            let i = usize::try_from(i).unwrap();
+                            if i >= tab.elem.len() {
+                                return Err(Trap)?;
+                            }
+                            tab.elem[i] = val;
+                        }
+                        instr::Table::TableInit { elem, table } => todo!(),
+                        instr::Table::ElemDrop(x) => {
+                            let a = frame
+                                .module
+                                .read(|module_inst| module_inst.elem_addr(*x))
+                                .unwrap();
+                            self.elems[usize::from(a)].elem = Vec::new();
+                        }
+                        instr::Table::TableCopy { x, y } => todo!(),
+                        instr::Table::TableGrow(x) => {
+                            const ERR: i32 = -1;
+
+                            let a = frame
+                                .module
+                                .read(|module_inst| module_inst.table_addr(*x))
+                                .unwrap();
+
+                            let n = values.pop_i32();
+                            let n = u32::try_from(n).unwrap();
+
+                            let val = values.pop_ref();
+
+                            match table_grow(&mut self.tables, a, n, val) {
+                                Ok(sz) => {
+                                    values.push(i32::try_from(sz).unwrap().into());
+                                }
+                                Err(_) => {
+                                    values.push(ERR.into());
+                                }
+                            }
+                        }
+                        instr::Table::TableSize(x) => {
+                            let a = frame
+                                .module
+                                .read(|module_inst| module_inst.table_addr(*x))
+                                .unwrap();
+                            let tab = &self.tables[usize::from(a)];
+                            let sz = tab.elem.len();
+                            values.push(i32::try_from(sz).unwrap().into());
+                        }
+                        instr::Table::TableFill(_) => todo!(),
+                    },
                     Instr::Mem(_) => todo!(),
                     Instr::Num(instr) => match instr {
                         instr::Num::Constant(c) => match c {
@@ -1365,4 +1422,30 @@ fn func_call(
     }
 
     Ok(())
+}
+
+fn table_grow(tables: &mut [TableInst], addr: TableAddr, n: u32, r: Ref) -> Result<usize, Error> {
+    let tab = tables
+        .get_mut(usize::from(addr))
+        .ok_or(InnerError::CouldNotGrowTable)?;
+    let sz = tab.elem.len();
+    let n = usize::try_from(n).unwrap();
+
+    let Some(len) = sz.checked_add(n) else {
+        return Err(Error::from(InnerError::CouldNotGrowTable));
+    };
+    if len > usize::try_from(u32::MAX).unwrap() {
+        return Err(Error::from(InnerError::CouldNotGrowTable));
+    }
+
+    if let Some(max) = tab.ty.lim.max {
+        let max = usize::try_from(max).unwrap();
+        if len > max {
+            return Err(Error::from(InnerError::CouldNotGrowTable));
+        }
+    }
+
+    tab.elem.extend(iter::repeat(r).take(n));
+    tab.ty.lim.min = u32::try_from(len).unwrap();
+    Ok(sz)
 }

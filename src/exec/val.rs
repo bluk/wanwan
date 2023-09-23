@@ -164,6 +164,24 @@ impl From<ExternAddr> for Val {
     }
 }
 
+impl From<Num> for Val {
+    fn from(value: Num) -> Self {
+        Self::Num(value)
+    }
+}
+
+impl From<Vec> for Val {
+    fn from(value: Vec) -> Self {
+        Self::Vec(value)
+    }
+}
+
+impl From<Ref> for Val {
+    fn from(value: Ref) -> Self {
+        Self::Ref(value)
+    }
+}
+
 impl From<Val> for ValTy {
     fn from(value: Val) -> Self {
         match value {

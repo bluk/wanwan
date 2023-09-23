@@ -224,7 +224,7 @@ impl Limits {
         let m = max_present.then(|| decode_u32(reader)).transpose()?;
 
         if let Some(m) = m {
-            if m > n {
+            if m < n {
                 return Err(DecodeError::InvalidLimits);
             }
         }
