@@ -6,6 +6,7 @@ use alloc::fmt;
 use std::{error, fmt, io};
 
 pub mod binary;
+pub mod text;
 
 /// Wrapper for read error.
 ///
