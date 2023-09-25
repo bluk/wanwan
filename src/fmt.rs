@@ -12,8 +12,8 @@ pub mod text;
 ///
 /// The primary purpose is to determine if the error is because an end of file
 /// condition has been encountered.
-#[derive(Debug, PartialEq, Eq)]
-struct ReadError<E> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ReadError<E> {
     inner: E,
     is_eof: bool,
 }
@@ -56,7 +56,7 @@ where
 }
 
 /// Trait used to read bytes.
-trait Read {
+pub trait Read {
     /// Error type for methods
     type Error;
 
@@ -74,7 +74,16 @@ trait Read {
     /// # Errors
     ///
     /// Returns a [`ReadError`] which wraps an inner error and determines if an EOF condition was reached.
-    fn peek(&mut self) -> Result<u8, ReadError<Self::Error>>;
+    fn peek(&mut self) -> Option<u8>;
+
+    /// Returns the second next byte but does not consume.
+    ///
+    /// Repeated peeks (with no [next()][Read::next] call) should return the same byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ReadError`] which wraps an inner error and determines if an EOF condition was reached.
+    fn peek2(&mut self) -> Option<u8>;
 
     /// Returns the position in the stream of bytes.
     fn pos(&self) -> u64;
@@ -95,12 +104,13 @@ trait Read {
 /// A wrapper to implement this crate's [`Read`] trait for [`std::io::Read`] trait implementations.
 #[cfg(feature = "std")]
 #[derive(Debug)]
-struct IoRead<R>
+pub struct IoRead<R>
 where
     R: io::Read,
 {
     iter: io::Bytes<R>,
-    peeked_byte: Option<u8>,
+    peeked_byte: Option<Result<u8, ReadError<io::Error>>>,
+    peeked_byte_2: Option<Result<u8, ReadError<io::Error>>>,
     byte_offset: u64,
 }
 
@@ -114,6 +124,7 @@ where
         IoRead {
             iter: reader.bytes(),
             peeked_byte: None,
+            peeked_byte_2: None,
             byte_offset: 0,
         }
     }
@@ -130,8 +141,9 @@ where
     fn next(&mut self) -> Result<u8, ReadError<Self::Error>> {
         match self.peeked_byte.take() {
             Some(b) => {
+                self.peeked_byte = self.peeked_byte_2.take();
                 self.byte_offset += 1;
-                Ok(b)
+                b
             }
             None => match self.iter.next() {
                 Some(Ok(b)) => {
@@ -151,22 +163,63 @@ where
     }
 
     #[inline]
-    fn peek(&mut self) -> Result<u8, ReadError<Self::Error>> {
-        match self.peeked_byte {
-            Some(b) => Ok(b),
-            None => match self.iter.next() {
-                Some(Ok(b)) => {
-                    self.peeked_byte = Some(b);
-                    Ok(b)
+    fn peek(&mut self) -> Option<u8> {
+        match &self.peeked_byte {
+            Some(b) => match b {
+                Ok(b) => Some(*b),
+                Err(_) => None,
+            },
+            None => {
+                assert!(self.peeked_byte_2.is_none());
+                match self.iter.next() {
+                    Some(Ok(b)) => {
+                        self.peeked_byte = Some(Ok(b));
+                        Some(b)
+                    }
+                    Some(Err(err)) => {
+                        let is_eof = err.kind() == io::ErrorKind::UnexpectedEof;
+                        self.peeked_byte = Some(Err(ReadError::new(err, is_eof)));
+                        None
+                    }
+                    None => {
+                        self.peeked_byte = Some(Err(ReadError::new(
+                            io::Error::new(io::ErrorKind::UnexpectedEof, "could not get next byte"),
+                            true,
+                        )));
+                        None
+                    }
                 }
-                Some(Err(err)) => {
-                    let is_eof = err.kind() == io::ErrorKind::UnexpectedEof;
-                    Err(ReadError::new(err, is_eof))
-                }
-                None => Err(ReadError::new(
-                    io::Error::new(io::ErrorKind::UnexpectedEof, "could not get next byte"),
-                    true,
-                )),
+            }
+        }
+    }
+
+    #[inline]
+    fn peek2(&mut self) -> Option<u8> {
+        match &self.peeked_byte_2 {
+            Some(b) => match b {
+                Ok(b) => Some(*b),
+                Err(_) => None,
+            },
+            None => match self.peek() {
+                Some(_) => match self.iter.next() {
+                    Some(Ok(b)) => {
+                        self.peeked_byte_2 = Some(Ok(b));
+                        Some(b)
+                    }
+                    Some(Err(err)) => {
+                        let is_eof = err.kind() == io::ErrorKind::UnexpectedEof;
+                        self.peeked_byte_2 = Some(Err(ReadError::new(err, is_eof)));
+                        None
+                    }
+                    None => {
+                        self.peeked_byte_2 = Some(Err(ReadError::new(
+                            io::Error::new(io::ErrorKind::UnexpectedEof, "could not get next byte"),
+                            true,
+                        )));
+                        None
+                    }
+                },
+                None => None,
             },
         }
     }
@@ -192,7 +245,7 @@ impl std::error::Error for OutOfBoundsError {}
 
 /// A wrapper to implement this crate's [`Read`] trait for byte slices.
 #[derive(Debug)]
-struct SliceRead<'a> {
+pub struct SliceRead<'a> {
     slice: &'a [u8],
     byte_offset: usize,
 }
@@ -223,11 +276,20 @@ impl<'a> Read for SliceRead<'a> {
     }
 
     #[inline]
-    fn peek(&mut self) -> Result<u8, ReadError<Self::Error>> {
+    fn peek(&mut self) -> Option<u8> {
         if self.byte_offset < self.slice.len() {
-            Ok(self.slice[self.byte_offset])
+            Some(self.slice[self.byte_offset])
         } else {
-            Err(ReadError::new(OutOfBoundsError, true))
+            None
+        }
+    }
+
+    #[inline]
+    fn peek2(&mut self) -> Option<u8> {
+        if self.byte_offset + 1 < self.slice.len() {
+            Some(self.slice[self.byte_offset + 1])
+        } else {
+            None
         }
     }
 

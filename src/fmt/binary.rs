@@ -296,7 +296,8 @@ impl BlockTy {
         R: Read,
         C: TypesContext,
     {
-        let peek = reader.peek()?;
+        // XXX: Could have a better error here when the peek fails.
+        let peek = reader.peek().ok_or(DecodeError::InvalidTypeIndex)?;
         if peek == 0x40 {
             reader.next()?;
             return Ok(Self::Val(None));

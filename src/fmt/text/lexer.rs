@@ -1,112 +1,143 @@
 //! Lexer to tokenize WAT.
 
-use core::{fmt, str::FromStr};
+#[cfg(all(feature = "alloc", not(feature = "std")))]
+use alloc::vec::Vec;
+use core::{
+    convert::Infallible,
+    fmt,
+    marker::PhantomData,
+    str::{FromStr, Utf8Error},
+};
+#[cfg(feature = "std")]
+use std::vec::Vec;
 
-const HORIZONTAL_TABULATION: char = '\u{09}';
-const LINE_FEED: char = '\u{0A}';
-const CARRIAGE_RETURN: char = '\u{0D}';
+use crate::fmt::{OutOfBoundsError, Read, ReadError, SliceRead};
+
+const HORIZONTAL_TABULATION: u8 = 9;
+const LINE_FEED: u8 = 10;
+const CARRIAGE_RETURN: u8 = 13;
 
 #[inline]
 #[must_use]
-const fn is_space(ch: char) -> bool {
-    matches!(ch, ' ' | HORIZONTAL_TABULATION)
+const fn is_space(b: u8) -> bool {
+    matches!(b, b' ' | HORIZONTAL_TABULATION)
 }
 
 /// Returns true if the byte is a newline character.
 #[inline]
 #[must_use]
-const fn is_newline(ch: char) -> bool {
-    matches!(ch, LINE_FEED | CARRIAGE_RETURN)
+const fn is_newline(b: u8) -> bool {
+    matches!(b, LINE_FEED | CARRIAGE_RETURN)
 }
 
-#[must_use]
-fn skip_space(s: &str, skip_new_lines: bool) -> usize {
-    let mut char_indices = s.char_indices().peekable();
+fn skip_space<B, R>(
+    input: &mut R,
+    buf: &mut B,
+    consume_new_lines: bool,
+) -> Result<(), TokenizerError<B::Error, ReadError<R::Error>>>
+where
+    B: Buf,
+    R: Read,
+{
+    'outer: loop {
+        let Some(b) = input.peek() else {
+            return Ok(());
+        };
 
-    'outer: while let Some((pos, ch)) = char_indices.next() {
-        if is_space(ch) || is_newline(ch) {
+        if is_space(b) || is_newline(b) {
+            let b = input.next().map_err(TokenizerError::Read)?;
+            buf.push(b).map_err(TokenizerError::Buf)?;
             continue;
         }
 
-        if is_newline(ch) {
-            if skip_new_lines {
+        if is_newline(b) {
+            if consume_new_lines {
+                let b = input.next().map_err(TokenizerError::Read)?;
+                buf.push(b).map_err(TokenizerError::Buf)?;
                 continue;
             }
 
-            return pos;
+            return Ok(());
         }
 
-        match ch {
-            ';' => {
-                let Some((_, ch)) = char_indices.peek() else {
-                    return pos;
+        match b {
+            b';' => {
+                let Some(b) = input.peek2() else {
+                    return Ok(());
                 };
-                if *ch != ';' {
-                    return pos;
+                if b != b';' {
+                    return Ok(());
                 }
-                let _ = char_indices.next();
 
                 // Skip line comment
-                for (_, ch) in char_indices.by_ref() {
-                    if ch == LINE_FEED {
+                loop {
+                    let b = input.next().map_err(TokenizerError::Read)?;
+                    buf.push(b).map_err(TokenizerError::Buf)?;
+
+                    if b == LINE_FEED {
                         continue 'outer;
                     }
                 }
-                return s.len();
             }
-            '(' => {
-                let Some((_, ch)) = char_indices.peek() else {
-                    return pos;
+            b'(' => {
+                let Some(b) = input.peek2() else {
+                    return Ok(());
                 };
-                if *ch != ';' {
-                    return pos;
+
+                if b != b';' {
+                    return Ok(());
                 }
-                let _ = char_indices.next();
 
                 // Skip block comment
-                let mut end_delim_count = 1usize;
-                while let Some((_, ch)) = char_indices.next() {
-                    match ch {
-                        '(' => {
-                            if let Some((_, ch)) = char_indices.peek() {
-                                if *ch == ';' {
-                                    let _ = char_indices.next();
-                                    end_delim_count += 1;
-                                }
+                let mut end_delim_count = 0usize;
+                loop {
+                    let b = input.next().map_err(TokenizerError::Read)?;
+                    buf.push(b).map_err(TokenizerError::Buf)?;
+
+                    match b {
+                        b'(' => {
+                            let Some(b) = input.peek() else {
+                                return Ok(());
+                            };
+                            if b == b';' {
+                                let b = input.next().map_err(TokenizerError::Read)?;
+                                buf.push(b).map_err(TokenizerError::Buf)?;
+
+                                end_delim_count += 1;
                             }
                         }
-                        ';' => {
-                            if let Some((_, ch)) = char_indices.peek() {
-                                if *ch == ')' {
-                                    let _ = char_indices.next();
-                                    end_delim_count -= 1;
-                                    if end_delim_count == 0 {
-                                        continue 'outer;
-                                    }
+                        b';' => {
+                            let Some(b) = input.peek() else {
+                                return Ok(());
+                            };
+                            if b == b')' {
+                                let b = input.next().map_err(TokenizerError::Read)?;
+                                buf.push(b).map_err(TokenizerError::Buf)?;
+
+                                end_delim_count -= 1;
+                                if end_delim_count == 0 {
+                                    continue 'outer;
                                 }
                             }
                         }
                         _ => {}
                     }
                 }
-                return s.len();
             }
-            _ => return pos,
+            _ => return Ok(()),
         }
     }
-
-    s.len()
 }
 
 #[inline]
 #[must_use]
-const fn is_id_char(ch: char) -> bool {
-    matches!(ch,
-      '0'..='9'
-      | 'A'..='Z'
-      | 'a'..='z'
-      | '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' | '/'
-      | ':' | '<' | '=' | '>' | '?' | '@' | '\\' | '^' | '_' | '`' | '|' | '~'
+const fn is_id_char(b: u8) -> bool {
+    matches!(b,
+      b'0'..=b'9'
+      | b'A'..=b'Z'
+      | b'a'..=b'z'
+      | b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'/'
+      | b':' | b'<' | b'=' | b'>' | b'?' | b'@' | b'\\' | b'^' | b'_' | b'`' | b'|' | b'~'
     )
 }
 
@@ -298,11 +329,11 @@ impl FromStr for Keyword {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenTy {
+pub enum TokenTy<K> {
     /// End of file
     Eof,
     /// Any literal terminal in the grammar
-    Keyword(Keyword),
+    Keyword(K),
     /// Unsigned number
     UnsignedInt,
     /// Signed number
@@ -323,40 +354,57 @@ pub enum TokenTy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lexeme<'a> {
-    pub inner: &'a str,
+    pub inner: &'a [u8],
     pub head_noise_len: usize,
-    pub tail_noise_len: usize,
+    pub token_end_offset: usize,
+    // tail_noise_len is inner.len() - token_end_offset
 }
 
 impl<'a> Lexeme<'a> {
+    /// Returns the parsed token as a string without any spaces or comments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying parsed token bytes are not an UTF-8 string.
     #[inline]
-    #[must_use]
-    pub fn noiseless_str(&self) -> &'a str {
-        &self.inner[self.head_noise_len..self.inner.len() - self.tail_noise_len]
+    pub fn as_noiseless_str(&self) -> Result<&'a str, Utf8Error> {
+        core::str::from_utf8(&self.inner[self.head_noise_len..self.token_end_offset])
+    }
+
+    /// Returns the entire lexeme as a string with all spaces and comments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes are not an UTF-8 string.
+    pub fn as_str(&self) -> Result<&'a str, Utf8Error> {
+        core::str::from_utf8(self.inner)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Token<'a> {
-    ty: TokenTy,
+pub struct Token<'a, K> {
+    ty: TokenTy<K>,
     lexeme: Option<Lexeme<'a>>,
 }
 
-impl<'a> fmt::Display for Token<'a> {
+impl<'a, K> fmt::Display for Token<'a, K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(lexeme) = self.lexeme {
-            return fmt::Display::fmt(lexeme.inner, f);
+            return fmt::Display::fmt(lexeme.as_str().map_err(|_| fmt::Error)?, f);
         }
         Ok(())
     }
 }
 
-impl<'a> Token<'a> {
+impl<'a, K> Token<'a, K> {
     /// Returns true if the token type is as expected and there are lexeme bytes representing the token.
     #[inline]
     #[must_use]
-    pub fn is_type_present(&self, ty: TokenTy) -> bool {
-        self.ty == ty && self.lexeme.is_some()
+    pub fn is_type_present(&self, ty: &TokenTy<K>) -> bool
+    where
+        K: PartialEq,
+    {
+        self.ty == *ty && self.lexeme.is_some()
     }
 
     #[inline]
@@ -377,8 +425,8 @@ impl<'a> Token<'a> {
     }
 
     #[must_use]
-    pub fn as_keyword(&self) -> Option<Keyword> {
-        match self.ty {
+    pub fn as_keyword(&self) -> Option<&K> {
+        match &self.ty {
             TokenTy::Eof
             | TokenTy::UnsignedInt
             | TokenTy::SignedInt
@@ -393,7 +441,7 @@ impl<'a> Token<'a> {
     }
 
     #[must_use]
-    pub fn as_noiseless_str(&self) -> Option<&str> {
+    pub fn as_string(&self) -> Option<Result<&str, Utf8Error>> {
         match self.ty {
             TokenTy::Eof
             | TokenTy::Keyword(_)
@@ -406,160 +454,311 @@ impl<'a> Token<'a> {
             | TokenTy::Reserved => None,
             TokenTy::String => self
                 .lexeme
-                .map(|l| &l.noiseless_str()[1..l.noiseless_str().len() - 1]),
+                .map(|l| l.as_noiseless_str().map(|s| &s[1..s.len() - 1])),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedLexeme {
+    pub inner: Vec<u8>,
+    pub head_noise_len: usize,
+    pub token_end_offset: usize,
+}
+
+impl<'a> From<Lexeme<'a>> for OwnedLexeme {
+    fn from(value: Lexeme<'a>) -> Self {
+        OwnedLexeme {
+            inner: value.inner.to_vec(),
+            head_noise_len: value.head_noise_len,
+            token_end_offset: value.token_end_offset,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedToken<K> {
+    ty: TokenTy<K>,
+    lexeme: Option<OwnedLexeme>,
+}
+
+impl<'a, K> From<Token<'a, K>> for OwnedToken<K> {
+    fn from(value: Token<'a, K>) -> Self {
+        Self {
+            ty: value.ty,
+            lexeme: value.lexeme.map(OwnedLexeme::from),
+        }
+    }
+}
+
+pub trait Buf {
+    type Error;
+
+    fn clear(&mut self);
+
+    #[must_use]
+    fn len(&self) -> usize;
+
+    #[must_use]
+    fn is_empty(&self) -> bool;
+
+    /// Pushes a byte into the buffer.
+    ///
+    /// # Errors
+    ///
+    /// If the byte cannot be pushed into the buffer.
+    fn push(&mut self, b: u8) -> Result<(), Self::Error>;
+
+    #[must_use]
+    fn as_slice(&self) -> &[u8];
+}
+
+impl Buf for Vec<u8> {
+    type Error = Infallible;
+
+    fn clear(&mut self) {
+        (*self).clear();
+    }
+
+    fn len(&self) -> usize {
+        (*self).len()
+    }
+
+    fn is_empty(&self) -> bool {
+        (*self).is_empty()
+    }
+
+    fn push(&mut self, b: u8) -> Result<(), Self::Error> {
+        (*self).push(b);
+        Ok(())
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        (*self).as_slice()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenizerError<B, R> {
+    Buf(B),
+    Read(R),
 }
 
 #[derive(Debug)]
-struct Tokenizer<'a> {
-    input: &'a str,
-    is_eof: bool,
+pub struct Tokenizer<B, R, BE, RE> {
+    buf: B,
+    input: R,
+    held_error: Option<TokenizerError<BE, RE>>,
 }
 
-impl<'a> Tokenizer<'a> {
+impl<B, R, BE, RE> Tokenizer<B, R, BE, RE> {
     #[inline]
     #[must_use]
-    const fn new(input: &'a str) -> Self {
+    fn new(buf: B, input: R) -> Self {
         Self {
+            buf,
             input,
-            is_eof: false,
+            held_error: None,
         }
     }
+}
 
-    fn advance(&mut self, ty: TokenTy, head_noise_len: usize, lexeme_len: usize) -> Token<'a> {
-        let len = head_noise_len + lexeme_len;
-        let tail_noise_len = skip_space(&self.input[len..], false);
+type NextTokenResult<'a, K, BE, RE> = Result<Token<'a, K>, TokenizerError<BE, ReadError<RE>>>;
 
-        let len = len + tail_noise_len;
+impl<B, R, BE, RE> Tokenizer<B, R, BE, ReadError<RE>>
+where
+    B: Buf<Error = BE>,
+    R: Read<Error = RE>,
+{
+    fn advance<K>(
+        &mut self,
+        ty: TokenTy<K>,
+        head_noise_len: usize,
+        token_end_offset: usize,
+    ) -> Token<'_, K> {
+        match skip_space(&mut self.input, &mut self.buf, false) {
+            Ok(()) => {}
+            Err(e) => {
+                self.held_error = Some(e);
+            }
+        }
+
         let token = Token {
             ty,
             lexeme: Some(Lexeme {
-                inner: &self.input[..len],
+                inner: self.buf.as_slice(),
                 head_noise_len,
-                tail_noise_len,
+                token_end_offset,
             }),
         };
-
-        self.input = &self.input[len..];
 
         token
     }
 
     #[allow(clippy::too_many_lines)]
-    fn next_token(&mut self) -> Option<Token<'a>> {
-        if self.is_eof {
-            return None;
+    fn next_token<K>(&mut self) -> NextTokenResult<'_, K, BE, RE>
+    where
+        K: FromStr,
+    {
+        if let Some(e) = self.held_error.take() {
+            return Err(e);
         }
 
-        let input = self.input;
+        self.buf.clear();
 
-        if input.is_empty() {
-            self.is_eof = true;
-            return Some(self.advance(TokenTy::Eof, 0, 0));
+        match skip_space(&mut self.input, &mut self.buf, true) {
+            Ok(()) => {}
+            Err(e) => {
+                self.held_error = Some(e);
+
+                return Ok(Token {
+                    ty: TokenTy::Eof,
+                    lexeme: Some(Lexeme {
+                        inner: self.buf.as_slice(),
+                        head_noise_len: self.buf.len(),
+                        token_end_offset: self.buf.len(),
+                    }),
+                });
+            }
         }
 
-        let head_noise_len = skip_space(input, true);
-        let input = &input[head_noise_len..];
+        let head_noise_len = self.buf.len();
 
-        let mut end_pos = input.len();
+        macro_rules! read_next {
+            () => {{
+                let b = self.input.next().map_err(TokenizerError::Read)?;
+                self.buf.push(b).map_err(TokenizerError::Buf)?;
+                b
+            }};
+        }
 
-        let mut char_indicies = input.char_indices().peekable();
         // XXX: What about non-ASCII characters or the question mark, comma, semicolon, or bracket?
         // Based on the token definition, tokens are separated by
         let mut is_in_string = false;
-        if let Some((_, first_ch)) = char_indicies.peek() {
-            match first_ch {
-                '(' | ')' => {
-                    end_pos = 1;
+        let Some(b) = self.input.peek() else {
+            match self.input.next() {
+                Ok(_) => unreachable!(),
+                Err(e) => {
+                    self.held_error = Some(TokenizerError::Read(e));
                 }
-                _ => loop {
-                    let Some((pos, ch)) = char_indicies.next() else {
-                        break;
-                    };
+            }
 
-                    if is_in_string && ch == '\\' {
-                        if let Some((_, ch)) = char_indicies.peek() {
-                            if *ch == '"' {
-                                let _ = char_indicies.next();
-                            }
-                        }
-                    }
+            return Ok(Token {
+                ty: TokenTy::Eof,
+                lexeme: Some(Lexeme {
+                    inner: self.buf.as_slice(),
+                    head_noise_len: self.buf.len(),
+                    token_end_offset: self.buf.len(),
+                }),
+            });
+        };
+        match b {
+            b'(' | b')' => {
+                let _ = read_next!();
+            }
+            _ => 'outer: loop {
+                macro_rules! peek_next {
+                    () => {{
+                        let Some(b) = self.input.peek() else {
+                            break 'outer;
+                        };
+                        b
+                    }};
+                }
 
-                    if ch == '"' {
-                        is_in_string = !is_in_string;
-                    }
+                macro_rules! peek2_next {
+                    () => {{
+                        let Some(b) = self.input.peek2() else {
+                            let _ = read_next!();
+                            break 'outer;
+                        };
+                        b
+                    }};
+                }
 
-                    if is_in_string {
+                let b = peek_next!();
+
+                if is_in_string && b == b'\\' {
+                    let b = peek2_next!();
+                    if b == b'"' {
+                        let _ = read_next!();
+                        let _ = read_next!();
                         continue;
                     }
+                }
 
-                    if is_space(ch) || is_newline(ch) {
-                        end_pos = pos;
-                        break;
-                    }
+                if b == b'"' {
+                    is_in_string = !is_in_string;
+                }
 
-                    match ch {
-                        ';' => {
-                            if let Some((_, ch)) = char_indicies.peek() {
-                                if *ch == ';' {
-                                    end_pos = pos;
-                                    break;
-                                }
-                            }
-                        }
-                        '(' | ')' => {
-                            end_pos = pos;
+                if is_in_string {
+                    let _ = read_next!();
+                    continue;
+                }
+
+                if is_space(b) || is_newline(b) {
+                    break;
+                }
+
+                match b {
+                    b';' => {
+                        let b = peek2_next!();
+                        if b == b';' {
                             break;
                         }
-                        _ => {}
                     }
-                },
-            }
-        }
-        drop(char_indicies);
+                    b'(' | b')' => {
+                        break;
+                    }
+                    _ => {}
+                }
 
-        let token = &input[..end_pos];
+                let _ = read_next!();
+            },
+        }
+        let token_end_offset = self.buf.len();
+
+        let token = &self.buf.as_slice()[head_noise_len..];
         macro_rules! ret_ty {
             ($ty:expr) => {
-                return Some(self.advance($ty, head_noise_len, token.len()));
+                return Ok(self.advance($ty, head_noise_len, token_end_offset));
             };
         }
-        let mut chars = token.chars().peekable();
+        let mut bytes = token.iter().copied().peekable();
 
         macro_rules! require_next_ch_else {
             ($err_ty:expr) => {{
-                let Some(ch) = chars.next() else {
+                let Some(b) = bytes.next() else {
                     ret_ty!($err_ty);
                 };
-                ch
+                b
             }};
         }
 
         macro_rules! tokenize_hexnum_or_hexfloat {
             ($ty:expr) => {
                 // hexnum or hexfloat
-                let ch = require_next_ch_else!(TokenTy::Reserved);
-                if !ch.is_ascii_hexdigit() {
+                let b = require_next_ch_else!(TokenTy::Reserved);
+                if !b.is_ascii_hexdigit() {
                     ret_ty!(TokenTy::Reserved);
                 }
 
                 loop {
-                    let ch = require_next_ch_else!($ty);
+                    let b = require_next_ch_else!($ty);
 
-                    if ch.is_ascii_hexdigit() {
+                    if b.is_ascii_hexdigit() {
                         continue;
                     }
 
-                    if ch == '_' {
-                        let ch = require_next_ch_else!(TokenTy::Reserved);
-                        if !ch.is_ascii_hexdigit() {
+                    if b == b'_' {
+                        let b = require_next_ch_else!(TokenTy::Reserved);
+                        if !b.is_ascii_hexdigit() {
                             ret_ty!(TokenTy::Reserved);
                         }
                         continue;
                     }
 
-                    if ch == '.' {
+                    if b == b'.' {
                         break;
                     }
 
@@ -575,21 +774,21 @@ impl<'a> Tokenizer<'a> {
             ($ty:expr) => {
                 // num or float
                 loop {
-                    let ch = require_next_ch_else!($ty);
+                    let b = require_next_ch_else!($ty);
 
-                    if ch.is_ascii_digit() {
+                    if b.is_ascii_digit() {
                         continue;
                     }
 
-                    if ch == '_' {
-                        let ch = require_next_ch_else!(TokenTy::Reserved);
-                        if !ch.is_ascii_digit() {
+                    if b == b'_' {
+                        let b = require_next_ch_else!(TokenTy::Reserved);
+                        if !b.is_ascii_digit() {
                             ret_ty!(TokenTy::Reserved);
                         }
                         continue;
                     }
 
-                    if ch == '.' {
+                    if b == b'.' {
                         break;
                     }
 
@@ -604,12 +803,12 @@ impl<'a> Tokenizer<'a> {
         macro_rules! tokenize_hex_or_non_hex_value {
             ($ty:expr) => {
                 // could be a hexnum
-                let ch = require_next_ch_else!($ty);
-                match ch {
-                    'x' => {
+                let b = require_next_ch_else!($ty);
+                match b {
+                    b'x' => {
                         tokenize_hexnum_or_hexfloat!($ty);
                     }
-                    _ if ch.is_ascii_digit() || ch == '_' => {
+                    _ if b.is_ascii_digit() || b == b'_' => {
                         tokenize_num_or_float!($ty);
                     }
                     _ => {
@@ -619,16 +818,19 @@ impl<'a> Tokenizer<'a> {
             };
         }
 
-        let Some(first_ch) = chars.next() else {
-            self.is_eof = true;
-            return Some(self.advance(TokenTy::Eof, head_noise_len, 0));
+        let Some(first_byte) = bytes.next() else {
+            unreachable!()
         };
 
-        match first_ch {
-            'a'..='z' => {
+        match first_byte {
+            b'a'..=b'z' => {
                 // Keyword
-                if chars.all(is_id_char) {
-                    let Ok(keyword) = token.parse::<Keyword>() else {
+                if bytes.all(is_id_char) {
+                    let Ok(s) = core::str::from_utf8(token) else {
+                        ret_ty!(TokenTy::Reserved);
+                    };
+
+                    let Ok(keyword) = s.parse::<K>() else {
                         ret_ty!(TokenTy::Reserved);
                     };
 
@@ -637,48 +839,48 @@ impl<'a> Tokenizer<'a> {
 
                 ret_ty!(TokenTy::Reserved);
             }
-            '$' => {
+            b'$' => {
                 // The first character must exist
-                let first_ch = require_next_ch_else!(TokenTy::Reserved);
-                if is_id_char(first_ch) && chars.all(is_id_char) {
+                let first_byte = require_next_ch_else!(TokenTy::Reserved);
+                if is_id_char(first_byte) && bytes.all(is_id_char) {
                     ret_ty!(TokenTy::Identifier);
                 }
 
                 ret_ty!(TokenTy::Reserved);
             }
-            '"' => {
+            b'"' => {
                 // String
                 loop {
-                    let ch = require_next_ch_else!(TokenTy::Reserved);
+                    let b = require_next_ch_else!(TokenTy::Reserved);
 
-                    if ch.is_ascii_control() {
+                    if b.is_ascii_control() {
                         ret_ty!(TokenTy::Reserved);
                     }
 
-                    match ch {
-                        '"' => {
-                            if chars.next().is_some() {
+                    match b {
+                        b'"' => {
+                            if bytes.next().is_some() {
                                 ret_ty!(TokenTy::Reserved);
                             }
 
                             ret_ty!(TokenTy::String);
                         }
-                        '\\' => {
-                            let ch = require_next_ch_else!(TokenTy::Reserved);
-                            match ch {
-                                't' | 'n' | 'r' | '"' | '\'' | '\\' => {}
-                                'u' => {
+                        b'\\' => {
+                            let b = require_next_ch_else!(TokenTy::Reserved);
+                            match b {
+                                b't' | b'n' | b'r' | b'"' | b'\'' | b'\\' => {}
+                                b'u' => {
                                     // TODO: Need to detect the next few characters are a valid Unicode hexadecimal number
                                     todo!()
                                 }
                                 _ => {
-                                    if !ch.is_ascii_hexdigit() {
+                                    if !b.is_ascii_hexdigit() {
                                         ret_ty!(TokenTy::Reserved);
                                     }
-                                    let Some(ch) = chars.next() else {
+                                    let Some(b) = bytes.next() else {
                                         ret_ty!(TokenTy::Reserved);
                                     };
-                                    if !ch.is_ascii_hexdigit() {
+                                    if !b.is_ascii_hexdigit() {
                                         ret_ty!(TokenTy::Reserved);
                                     }
                                 }
@@ -688,24 +890,24 @@ impl<'a> Tokenizer<'a> {
                     }
                 }
             }
-            '(' => {
+            b'(' => {
                 debug_assert_eq!(token.len(), 1);
                 ret_ty!(TokenTy::OpenParen);
             }
-            ')' => {
+            b')' => {
                 debug_assert_eq!(token.len(), 1);
                 ret_ty!(TokenTy::CloseParen);
             }
-            '+' | '-' => {
+            b'+' | b'-' => {
                 // a signed number or floating point
-                let ch = require_next_ch_else!(TokenTy::Reserved);
-                match ch {
-                    '0' => {
+                let b = require_next_ch_else!(TokenTy::Reserved);
+                match b {
+                    b'0' => {
                         tokenize_hex_or_non_hex_value!(TokenTy::SignedInt);
                     }
-                    _ if ch.is_ascii_digit() => {
+                    _ if b.is_ascii_digit() => {
                         // XXX: Order matters
-                        debug_assert_ne!(ch, '0');
+                        debug_assert_ne!(b, b'0');
 
                         tokenize_num_or_float!(TokenTy::SignedInt);
                     }
@@ -714,12 +916,12 @@ impl<'a> Tokenizer<'a> {
                     }
                 }
             }
-            '0' => {
+            b'0' => {
                 tokenize_hex_or_non_hex_value!(TokenTy::UnsignedInt);
             }
-            _ if first_ch.is_ascii_digit() => {
+            _ if first_byte.is_ascii_digit() => {
                 // XXX: Order matters
-                debug_assert_ne!(first_ch, '0');
+                debug_assert_ne!(first_byte, b'0');
 
                 tokenize_num_or_float!(TokenTy::UnsignedInt);
             }
@@ -733,49 +935,65 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
-impl<'a> IntoIterator for Tokenizer<'a> {
-    type Item = Token<'a>;
-
-    type IntoIter = IntoIter<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        IntoIter::new(self)
-    }
-}
-
-/// An [`Iterator`] for [`Token`]s.
-///
-/// Use [`tokenize()`] to create the iterator.
+/// An [`Iterator`] for [`OwnedToken`]s.
 #[derive(Debug)]
-pub struct IntoIter<'a> {
-    tokenizer: Tokenizer<'a>,
+pub struct OwnedIter<B, R, K, BE, RE> {
+    tokenizer: Tokenizer<B, R, BE, RE>,
+    k_ty: PhantomData<K>,
 }
 
-impl<'a> IntoIter<'a> {
-    const fn new(tokenizer: Tokenizer<'a>) -> Self {
-        Self { tokenizer }
+impl<B, R, K, BE, RE> OwnedIter<B, R, K, BE, RE> {
+    pub fn new(tokenizer: Tokenizer<B, R, BE, RE>) -> Self {
+        Self {
+            tokenizer,
+            k_ty: PhantomData,
+        }
     }
 }
 
-impl<'a> Iterator for IntoIter<'a> {
-    type Item = Token<'a>;
+impl<B, R, K, BE, RE> Iterator for OwnedIter<B, R, K, BE, ReadError<RE>>
+where
+    R: Read<Error = RE>,
+    B: Buf<Error = BE>,
+    K: FromStr,
+{
+    type Item = Result<OwnedToken<K>, TokenizerError<BE, ReadError<RE>>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.tokenizer.next_token()
+        Some(self.tokenizer.next_token().map(|t| OwnedToken {
+            ty: t.ty,
+            lexeme: t.lexeme.map(|l| OwnedLexeme {
+                inner: l.inner.to_vec(),
+                head_noise_len: l.head_noise_len,
+                token_end_offset: l.token_end_offset,
+            }),
+        }))
     }
 }
 
 /// Tokenizes a string.
 #[must_use]
-pub const fn tokenize(input: &str) -> IntoIter<'_> {
-    IntoIter::new(Tokenizer::new(input))
+pub fn from_str(
+    input: &str,
+) -> Tokenizer<Vec<u8>, SliceRead<'_>, Infallible, ReadError<OutOfBoundsError>> {
+    Tokenizer::new(Vec::new(), SliceRead::new(input.as_bytes()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::{
+        string::{String, ToString},
+        vec,
+    };
     use core::iter;
+    #[cfg(feature = "std")]
+    use std::{
+        string::{String, ToString},
+        vec,
+    };
 
     use proptest::prelude::*;
 
@@ -890,7 +1108,6 @@ mod tests {
     }
 
     const ZERO_COUNT_VALUE: &[usize] = &[0];
-    const INTERNAL_UNDERSCORE_COUNT_VALID_VALUES: &[usize] = &[0, 0, 0, 0, 0, 0, 0, 1, 1, 1];
     const INTERNAL_UNDERSCORE_COUNT_INVALID_VALUES: &[usize] = &[0, 0, 0, 0, 0, 0, 0, 1, 1, 2];
     const LEADING_UNDERSCORE_COUNT_INVALID_VALUES: &[usize] = &[0, 0, 0, 0, 0, 0, 0, 1, 2, 3];
     const TRAILING_UNDERSCORE_COUNT_INVALID_VALUES: &[usize] = &[0, 0, 0, 0, 0, 0, 0, 1, 2, 3];
@@ -900,36 +1117,36 @@ mod tests {
         #[allow(clippy::ignored_unit_patterns)]
         #[test]
         fn test_tokenize_unsigned(n_string in any::<u64>().prop_map(|n| n.to_string())) {
-            let mut tokenizer = tokenize(&n_string);
+            let mut tokenizer = from_str(&n_string);
 
             prop_assert_eq!(
-                Some(Token {
+                Ok(Token {
                     ty: TokenTy::UnsignedInt,
                     lexeme: Some(Lexeme {
-                        inner: &n_string,
+                        inner: n_string.as_bytes(),
                         head_noise_len: 0,
-                        tail_noise_len: 0
+                        token_end_offset: n_string.len(),
                     })
                 }),
-                tokenizer.next()
+                tokenizer.next_token::<Keyword>()
             );
         }
 
         #[allow(clippy::ignored_unit_patterns)]
         #[test]
         fn test_tokenize_unsigned_with_underscores(n_string in unsigned_underscored()) {
-            let mut tokenizer = tokenize(&n_string);
+            let mut tokenizer = from_str(&n_string);
 
             prop_assert_eq!(
-                Some(Token {
+                Ok(Token {
                     ty: TokenTy::UnsignedInt,
                     lexeme: Some(Lexeme {
-                        inner: &n_string,
+                        inner: n_string.as_bytes(),
                         head_noise_len: 0,
-                        tail_noise_len: 0
+                        token_end_offset: n_string.len(),
                     })
                 }),
-                tokenizer.next()
+                tokenizer.next_token::<Keyword>()
             );
         }
 
@@ -943,18 +1160,18 @@ mod tests {
                 prop::sample::select(ZERO_COUNT_VALUE),
                 )
             ) {
-            let mut tokenizer = tokenize(&n_string);
+            let mut tokenizer = from_str(&n_string);
 
             assert_eq!(
-                tokenizer.next(),
-                Some(Token {
+                Ok(Token {
                     ty: if is_valid { TokenTy::UnsignedInt } else { TokenTy::Reserved },
                     lexeme: Some(Lexeme {
-                        inner: &n_string,
+                        inner: n_string.as_bytes(),
                         head_noise_len: 0,
-                        tail_noise_len: 0
+                        token_end_offset: n_string.len(),
                     })
-                })
+                }),
+                tokenizer.next_token::<Keyword>()
             );
         }
 
@@ -968,18 +1185,18 @@ mod tests {
                 prop::sample::select(ZERO_COUNT_VALUE),
                 )
             ) {
-            let mut tokenizer = tokenize(&n_string);
+            let mut tokenizer = from_str(&n_string);
 
             prop_assert_eq!(
-                Some(Token {
+                Ok(Token {
                     ty: if is_valid { TokenTy::UnsignedInt } else { TokenTy::Reserved },
                     lexeme: Some(Lexeme {
-                        inner: &n_string,
+                        inner: n_string.as_bytes(),
                         head_noise_len: 0,
-                        tail_noise_len: 0
+                        token_end_offset: n_string.len(),
                     })
                 }),
-                tokenizer.next()
+                tokenizer.next_token::<Keyword>()
             );
         }
 
@@ -993,285 +1210,303 @@ mod tests {
                 prop::sample::select(TRAILING_UNDERSCORE_COUNT_INVALID_VALUES),
                 )
             ) {
-            let mut tokenizer = tokenize(&n_string);
+            let mut tokenizer = from_str(&n_string);
 
             assert_eq!(
-                tokenizer.next(),
-                Some(Token {
+                Ok(Token {
                     ty: if is_valid { TokenTy::UnsignedInt } else { TokenTy::Reserved },
                     lexeme: Some(Lexeme {
-                        inner: &n_string,
+                        inner: n_string.as_bytes(),
                         head_noise_len: 0,
-                        tail_noise_len: 0
+                        token_end_offset: n_string.len(),
                     })
-                })
+                }),
+                tokenizer.next_token::<Keyword>()
             );
         }
     }
 
     #[test]
     fn test_string() {
-        let mut tokenizer = tokenize(r#""hello world""#);
+        let mut tokenizer = from_str(r#""hello world""#);
 
+        let s = r#""hello world""#;
         assert_eq!(
-            tokenizer.next(),
-            Some(Token {
+            Ok(Token {
                 ty: TokenTy::String,
                 lexeme: Some(Lexeme {
-                    inner: r#""hello world""#,
+                    inner: s.as_bytes(),
                     head_noise_len: 0,
-                    tail_noise_len: 0
+                    token_end_offset: s.len(),
                 })
-            })
+            }),
+            tokenizer.next_token::<Keyword>()
         );
     }
 
     #[test]
     fn test_string_no_quote_end() {
-        let mut tokenizer = tokenize(r#""hello world"#);
+        let mut tokenizer = from_str(r#""hello world"#);
 
+        let s = r#""hello world"#;
         assert_eq!(
-            tokenizer.next(),
-            Some(Token {
+            Ok(Token {
                 ty: TokenTy::Reserved,
                 lexeme: Some(Lexeme {
-                    inner: r#""hello world"#,
+                    inner: s.as_bytes(),
                     head_noise_len: 0,
-                    tail_noise_len: 0
+                    token_end_offset: s.len()
                 })
-            })
+            }),
+            tokenizer.next_token::<Keyword>()
         );
     }
 
     #[test]
     fn test_string_escaped_quote() {
-        let mut tokenizer = tokenize(r#""hello\" \" world \" ""#);
+        let mut tokenizer = from_str(r#""hello\" \" world \" ""#);
 
+        let s = r#""hello\" \" world \" ""#;
         assert_eq!(
-            tokenizer.next(),
-            Some(Token {
+            Ok(Token {
                 ty: TokenTy::String,
                 lexeme: Some(Lexeme {
-                    inner: r#""hello\" \" world \" ""#,
+                    inner: s.as_bytes(),
                     head_noise_len: 0,
-                    tail_noise_len: 0
+                    token_end_offset: s.len()
                 })
-            })
+            }),
+            tokenizer.next_token::<Keyword>()
         );
     }
 
     #[test]
     fn test_identifier() {
-        let mut tokenizer = tokenize("$a");
+        let mut tokenizer = from_str("$a");
 
         assert_eq!(
-            tokenizer.next(),
-            Some(Token {
+            Ok(Token {
                 ty: TokenTy::Identifier,
                 lexeme: Some(Lexeme {
-                    inner: "$a",
+                    inner: "$a".as_bytes(),
                     head_noise_len: 0,
-                    tail_noise_len: 0
+                    token_end_offset: 2
                 })
-            })
+            }),
+            tokenizer.next_token::<Keyword>()
         );
     }
 
     #[test]
     fn test_dollar_sign_eof() {
-        let mut tokenizer = tokenize("$");
+        let mut tokenizer = from_str("$");
 
         assert_eq!(
-            tokenizer.next(),
-            Some(Token {
+            Ok(Token {
                 ty: TokenTy::Reserved,
                 lexeme: Some(Lexeme {
-                    inner: "$",
+                    inner: "$".as_bytes(),
                     head_noise_len: 0,
-                    tail_noise_len: 0
+                    token_end_offset: 1
                 })
-            })
+            }),
+            tokenizer.next_token::<Keyword>()
         );
     }
 
     #[test]
     fn test_dollar_sign_then_not_id_char() {
-        let mut tokenizer = tokenize("$ ");
+        let mut tokenizer = from_str("$ ");
 
         assert_eq!(
-            tokenizer.next(),
-            Some(Token {
+            Ok(Token {
                 ty: TokenTy::Reserved,
                 lexeme: Some(Lexeme {
-                    inner: "$ ",
+                    inner: "$ ".as_bytes(),
                     head_noise_len: 0,
-                    tail_noise_len: 1
+                    token_end_offset: 1
                 })
-            })
+            }),
+            tokenizer.next_token::<Keyword>()
         );
     }
 
     #[test]
     fn test_open_paren() {
-        let mut tokenizer = tokenize("(");
+        let mut tokenizer = from_str("(");
 
         assert_eq!(
-            tokenizer.next(),
-            Some(Token {
+            Ok(Token {
                 ty: TokenTy::OpenParen,
                 lexeme: Some(Lexeme {
-                    inner: "(",
+                    inner: "(".as_bytes(),
                     head_noise_len: 0,
-                    tail_noise_len: 0
+                    token_end_offset: 1
                 })
-            })
+            }),
+            tokenizer.next_token::<Keyword>()
         );
     }
 
     #[test]
     fn test_close_paren() {
-        let mut tokenizer = tokenize(") ");
+        let mut tokenizer = from_str(") ");
 
         assert_eq!(
-            tokenizer.next(),
-            Some(Token {
+            Ok(Token {
                 ty: TokenTy::CloseParen,
                 lexeme: Some(Lexeme {
-                    inner: ") ",
+                    inner: ") ".as_bytes(),
                     head_noise_len: 0,
-                    tail_noise_len: 1
+                    token_end_offset: 1
                 })
-            })
+            }),
+            tokenizer.next_token::<Keyword>()
         );
     }
 
     #[test]
     fn test_paren_with_trailing() {
-        let mut tokenizer = tokenize(" (abc ");
+        let mut tokenizer = from_str(" (abc ");
 
         assert_eq!(
-            tokenizer.next(),
-            Some(Token {
+            Ok(Token {
                 ty: TokenTy::OpenParen,
                 lexeme: Some(Lexeme {
-                    inner: " (",
+                    inner: " (".as_bytes(),
                     head_noise_len: 1,
-                    tail_noise_len: 0
+                    token_end_offset: 2
                 })
-            })
+            }),
+            tokenizer.next_token::<Keyword>()
         );
     }
 
     #[test]
     fn test_paren_with_leading() {
-        let mut tokenizer = tokenize("$id(abc");
+        let mut tokenizer = from_str("$id(abc");
 
         assert_eq!(
-            tokenizer.next(),
-            Some(Token {
+            Ok(Token {
                 ty: TokenTy::Identifier,
                 lexeme: Some(Lexeme {
-                    inner: "$id",
+                    inner: "$id".as_bytes(),
                     head_noise_len: 0,
-                    tail_noise_len: 0
+                    token_end_offset: 3
                 })
-            })
+            }),
+            tokenizer.next_token::<Keyword>()
         );
         assert_eq!(
-            tokenizer.next(),
-            Some(Token {
+            Ok(Token {
                 ty: TokenTy::OpenParen,
                 lexeme: Some(Lexeme {
-                    inner: "(",
+                    inner: "(".as_bytes(),
                     head_noise_len: 0,
-                    tail_noise_len: 0
+                    token_end_offset: 1
                 })
-            })
+            }),
+            tokenizer.next_token::<Keyword>()
+        );
+        assert_eq!(
+            Ok(Token {
+                ty: TokenTy::Reserved,
+                lexeme: Some(Lexeme {
+                    inner: "abc".as_bytes(),
+                    head_noise_len: 0,
+                    token_end_offset: 3
+                })
+            }),
+            tokenizer.next_token::<Keyword>()
         );
     }
 
     #[test]
     fn test_reserved_not_keyword() {
-        let mut tokenizer = tokenize("0$x");
+        let mut tokenizer = from_str("0$x");
 
         assert_eq!(
-            tokenizer.next(),
-            Some(Token {
+            Ok(Token {
                 ty: TokenTy::Reserved,
                 lexeme: Some(Lexeme {
-                    inner: "0$x",
+                    inner: "0$x".as_bytes(),
                     head_noise_len: 0,
-                    tail_noise_len: 0
+                    token_end_offset: 3,
                 })
-            })
+            }),
+            tokenizer.next_token::<Keyword>()
         );
     }
 
     #[test]
     fn test_reserved_two_strings() {
-        let mut tokenizer = tokenize(r#""a""b""#);
+        let mut tokenizer = from_str(r#""a""b""#);
 
+        let s = r#""a""b""#;
         assert_eq!(
-            tokenizer.next(),
-            Some(Token {
+            Ok(Token {
                 ty: TokenTy::Reserved,
                 lexeme: Some(Lexeme {
-                    inner: r#""a""b""#,
+                    inner: s.as_bytes(),
                     head_noise_len: 0,
-                    tail_noise_len: 0
+                    token_end_offset: s.len(),
                 })
-            })
+            }),
+            tokenizer.next_token::<Keyword>()
         );
     }
 
     #[test]
     fn test_module() {
-        let mut tokenizer = tokenize(r#"(module )"#);
+        let mut tokenizer = from_str(r#"(module )"#);
 
         assert_eq!(
-            tokenizer.next(),
-            Some(Token {
+            Ok(Token {
                 ty: TokenTy::OpenParen,
                 lexeme: Some(Lexeme {
-                    inner: "(",
+                    inner: "(".as_bytes(),
                     head_noise_len: 0,
-                    tail_noise_len: 0
+                    token_end_offset: 1
                 })
-            })
+            }),
+            tokenizer.next_token::<Keyword>()
         );
         assert_eq!(
-            tokenizer.next(),
-            Some(Token {
+            Ok(Token {
                 ty: TokenTy::Keyword(Keyword::Module),
                 lexeme: Some(Lexeme {
-                    inner: "module ",
+                    inner: "module ".as_bytes(),
                     head_noise_len: 0,
-                    tail_noise_len: 1
+                    token_end_offset: 6
                 })
-            })
+            }),
+            tokenizer.next_token::<Keyword>()
         );
         assert_eq!(
-            tokenizer.next(),
-            Some(Token {
+            Ok(Token {
                 ty: TokenTy::CloseParen,
                 lexeme: Some(Lexeme {
-                    inner: ")",
+                    inner: ")".as_bytes(),
                     head_noise_len: 0,
-                    tail_noise_len: 0
+                    token_end_offset: 1,
                 })
-            })
+            }),
+            tokenizer.next_token::<Keyword>()
         );
         assert_eq!(
-            tokenizer.next(),
-            Some(Token {
+            Ok(Token {
                 ty: TokenTy::Eof,
                 lexeme: Some(Lexeme {
-                    inner: "",
+                    inner: "".as_bytes(),
                     head_noise_len: 0,
-                    tail_noise_len: 0
+                    token_end_offset: 0,
                 })
-            })
+            }),
+            tokenizer.next_token::<Keyword>()
         );
-        assert_eq!(tokenizer.next(), None,);
+        assert_eq!(
+            Err(TokenizerError::Read(ReadError::new(OutOfBoundsError, true))),
+            tokenizer.next_token::<Keyword>()
+        );
     }
 }
