@@ -383,8 +383,8 @@ impl<'a> Lexeme<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Token<'a, K> {
-    ty: TokenTy<K>,
-    lexeme: Option<Lexeme<'a>>,
+    pub ty: TokenTy<K>,
+    pub lexeme: Option<Lexeme<'a>>,
 }
 
 impl<'a, K> fmt::Display for Token<'a, K> {
@@ -421,6 +421,38 @@ impl<'a, K> Token<'a, K> {
             lexeme.inner.len()
         } else {
             0
+        }
+    }
+
+    #[must_use]
+    pub fn is_open_paren(&self) -> bool {
+        match &self.ty {
+            TokenTy::Eof
+            | TokenTy::Keyword(_)
+            | TokenTy::UnsignedInt
+            | TokenTy::SignedInt
+            | TokenTy::FloatingPoint
+            | TokenTy::String
+            | TokenTy::Identifier
+            | TokenTy::CloseParen
+            | TokenTy::Reserved => false,
+            TokenTy::OpenParen => true,
+        }
+    }
+
+    #[must_use]
+    pub fn is_close_paren(&self) -> bool {
+        match &self.ty {
+            TokenTy::Eof
+            | TokenTy::Keyword(_)
+            | TokenTy::UnsignedInt
+            | TokenTy::SignedInt
+            | TokenTy::FloatingPoint
+            | TokenTy::String
+            | TokenTy::Identifier
+            | TokenTy::OpenParen
+            | TokenTy::Reserved => false,
+            TokenTy::CloseParen => true,
         }
     }
 
@@ -478,8 +510,8 @@ impl<'a> From<Lexeme<'a>> for OwnedLexeme {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedToken<K> {
-    ty: TokenTy<K>,
-    lexeme: Option<OwnedLexeme>,
+    pub ty: TokenTy<K>,
+    pub lexeme: Option<OwnedLexeme>,
 }
 
 impl<'a, K> From<Token<'a, K>> for OwnedToken<K> {
@@ -596,7 +628,7 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
-    fn next_token<K>(&mut self) -> NextTokenResult<'_, K, BE, RE>
+    pub fn next_token<K>(&mut self) -> NextTokenResult<'_, K, BE, RE>
     where
         K: FromStr,
     {
@@ -939,15 +971,25 @@ where
 #[derive(Debug)]
 pub struct OwnedIter<B, R, K, BE, RE> {
     tokenizer: Tokenizer<B, R, BE, RE>,
+    is_errored: bool,
     k_ty: PhantomData<K>,
 }
 
 impl<B, R, K, BE, RE> OwnedIter<B, R, K, BE, RE> {
-    pub fn new(tokenizer: Tokenizer<B, R, BE, RE>) -> Self {
+    #[inline]
+    #[must_use]
+    pub const fn new(tokenizer: Tokenizer<B, R, BE, RE>) -> Self {
         Self {
             tokenizer,
+            is_errored: false,
             k_ty: PhantomData,
         }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn into_inner(self) -> Tokenizer<B, R, BE, RE> {
+        self.tokenizer
     }
 }
 
@@ -960,14 +1002,16 @@ where
     type Item = Result<OwnedToken<K>, TokenizerError<BE, ReadError<RE>>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        Some(self.tokenizer.next_token().map(|t| OwnedToken {
-            ty: t.ty,
-            lexeme: t.lexeme.map(|l| OwnedLexeme {
-                inner: l.inner.to_vec(),
-                head_noise_len: l.head_noise_len,
-                token_end_offset: l.token_end_offset,
-            }),
-        }))
+        if self.is_errored {
+            return None;
+        }
+        match self.tokenizer.next_token().map(OwnedToken::from) {
+            Ok(t) => Some(Ok(t)),
+            Err(e) => {
+                self.is_errored = true;
+                Some(Err(e))
+            }
+        }
     }
 }
 
@@ -1493,6 +1537,22 @@ mod tests {
             }),
             tokenizer.next_token::<Keyword>()
         );
+        assert_eq!(
+            Ok(Token {
+                ty: TokenTy::Eof,
+                lexeme: Some(Lexeme {
+                    inner: "".as_bytes(),
+                    head_noise_len: 0,
+                    token_end_offset: 0,
+                })
+            }),
+            tokenizer.next_token::<Keyword>()
+        );
+        assert_eq!(
+            Err(TokenizerError::Read(ReadError::new(OutOfBoundsError, true))),
+            tokenizer.next_token::<Keyword>()
+        );
+        // TODO: This is unstable by repeating the error. What happens on std::io::Read version instead of slice?
         assert_eq!(
             Ok(Token {
                 ty: TokenTy::Eof,
